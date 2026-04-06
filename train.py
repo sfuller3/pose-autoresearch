@@ -28,7 +28,7 @@ INPUT_DIM = 51  # 17 keypoints × 3 (x, y, confidence)
 HIDDEN_DIM = 256
 NUM_LSTM_LAYERS = 2
 NUM_CLASSES = len(EVENT_CLASSES)  # 7 events
-SEQ_LEN = 30  # 30 frames = 1 second at 30fps
+SEQ_LEN = 150  # 150 frames = 5 seconds at 30fps
 BATCH_SIZE = 32
 LEARNING_RATE = 1e-3
 WEIGHT_DECAY = 1e-4

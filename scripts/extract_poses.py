@@ -87,7 +87,7 @@ def main():
     parser.add_argument(
         "--seq-len",
         type=int,
-        default=30,
+        default=150,
         help="Frames per sequence",
     )
     parser.add_argument(

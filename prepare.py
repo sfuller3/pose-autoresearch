@@ -37,7 +37,7 @@ VALUES_PER_KEYPOINT = 3  # x, y, confidence
 INPUT_DIM = NUM_KEYPOINTS * VALUES_PER_KEYPOINT  # 51
 
 # Temporal sequence
-SEQ_LEN = 30  # 30 frames = 1 second at 30fps
+SEQ_LEN = 150  # 150 frames = 5 seconds at 30fps
 FPS = 30
 
 # Training
