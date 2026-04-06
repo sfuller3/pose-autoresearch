@@ -1,285 +1,295 @@
-# Pose Autoresearch - Agent Instructions
+# Pose Autoresearch — Agent Directives
 
-You are an AI research assistant optimizing a model that detects human events from 17-point pose sequences.
+You are an autonomous research agent optimizing a model that classifies human
+events from COCO-17 pose keypoint sequences. This model is Stage 2 of a
+two-stage production system deployed in elder care facilities.
 
-## Your Goal
+## System Architecture Context
 
-**Maximize validation accuracy** on event classification.
-
-The model takes pose keypoint sequences as input and outputs event classifications.
-
-## Problem Setup
-
-**Input:**
-- Pose sequences: `(batch, seq_len, 51)` tensor
-- 51 = 17 keypoints × 3 values (x, y, confidence)
-- seq_len = 30 frames (1 second at 30fps)
-
-**Output:**
-- Classification over 7 event types:
-  1. Fall
-  2. Eating
-  3. Working Together
-  4. Aggression
-  5. Unstable Gait
-  6. Wandering
-  7. Sitting/Standing
-
-**Metric:**
-- Validation accuracy (higher is better)
-- Secondary: Per-class accuracy for rare events (falls most critical)
-
-## What You Can Modify
-
-Everything in `train.py`:
-
-**Architecture:**
-- Model class (`PoseEventClassifier`)
-- Number of layers, hidden dimensions
-- Conv kernel sizes, stride, padding
-- LSTM vs GRU vs Transformer
-- Attention mechanisms
-- Residual connections
-- Activation functions (ReLU, GELU, etc.)
-
-**Hyperparameters:**
-- Learning rate
-- Batch size
-- Weight decay
-- Dropout rate
-- Gradient clipping
-
-**Optimizer:**
-- AdamW vs SGD vs Adam
-- Learning rate schedule
-- Momentum, betas
-
-**Training:**
-- Data augmentation (temporal, spatial)
-- Loss function (CrossEntropy, Focal Loss, etc.)
-- Class weighting for imbalanced data
-
-## What You Cannot Modify
-
-`prepare.py` is fixed:
-- Data loading logic
-- Evaluation metric (accuracy)
-- Train/val/test splits
-- Time budget (5 minutes)
-
-## Experiment Process
-
-1. **Read** current `train.py`
-2. **Hypothesize** one improvement (architecture, hyperparameter, etc.)
-3. **Modify** `train.py`
-4. **Run:** `uv run train.py` (trains for 5 minutes)
-5. **Record** validation accuracy
-6. **Decide:**
-   - If accuracy **improved** → KEEP change
-   - If accuracy **same or worse** → DISCARD (revert to previous)
-7. **Repeat**
-
-## Constraints
-
-- **Fixed 5-minute training budget**
-- Single GPU (no distributed training)
-- Model must fit in memory
-- Batch size × seq_len must be reasonable
-
-## Starting Point (Baseline)
-
-**Architecture:** CNN + LSTM
 ```
-Conv1d(51 → 128, k=3) → BatchNorm → ReLU →
-Conv1d(128 → 256, k=3) → BatchNorm → ReLU →
-LSTM(256 → 256, 2 layers, dropout=0.2) →
-Linear(256 → 7)
+Stage 1: YOLO26 pose estimation (per-frame, runs on MemryX MX3 or GPU)
+    ↓
+    17 keypoints × 3 values (x, y, confidence) = 51 floats per frame
+    ↓
+Stage 2: YOUR MODEL (time-series classifier, runs on CPU or edge device)
+    ↓
+    Event classification (7 classes)
 ```
 
-**Optimizer:** AdamW
-- Learning rate: 1e-3
-- Weight decay: 1e-4
+Stage 1 is fixed — you cannot change it. Your model receives keypoint
+coordinates that have already been extracted by YOLO. This means:
 
-**Expected baseline:** ~60-70% validation accuracy (random = 14%)
+- You never see pixels, only joint coordinates
+- Keypoint noise from YOLO is part of your input distribution
+- Confidence values (third channel) indicate YOLO's certainty per joint
+- Some joints may be zero (occluded or undetected)
+- Frame rate is 30fps; temporal spacing is consistent
 
-## Improvement Strategies
+Your model must be small and fast. It will run on edge hardware alongside
+Stage 1, or on cloud CPUs. Target: **<1M parameters, <5ms per sequence**.
 
-### Architecture Ideas
+## Objective
 
-**1. Temporal modeling:**
-- Bidirectional LSTM (look ahead and behind)
-- Deeper/wider LSTM (more layers, larger hidden dim)
-- Transformer instead of LSTM (self-attention on temporal sequence)
-- Temporal Convolutional Networks (TCN) with dilated convolutions
+**Primary metric:** Validation accuracy across all 7 classes.
 
-**2. Spatial modeling:**
-- Process each keypoint separately before temporal aggregation
-- Graph Neural Networks (respect skeleton connectivity)
-- Attention over keypoints (which joints matter for which events?)
+**Secondary metric:** Per-class recall, weighted by priority. Use
+`evaluate_per_class()` from `prepare.py` after every run.
 
-**3. Multi-scale:**
-- Process multiple temporal scales (fast motions vs slow trends)
-- Pyramid pooling
-- Multi-resolution convolutions
+**Constraint:** Fixed 5-minute training budget per experiment.
 
-**4. Regularization:**
-- Dropout (current: 0.2, try 0.3-0.5)
-- Batch normalization
-- Layer normalization
-- Weight normalization
+## Event Classes (ordered by priority)
 
-**5. Advanced:**
-- Residual connections
-- Squeeze-and-excitation blocks
-- Separable convolutions (depthwise + pointwise)
+| # | Class | Priority | Signature in Skeleton Space |
+|---|-------|----------|-----------------------------|
+| 0 | **fall** | CRITICAL | Rapid downward hip velocity → aspect ratio inverts (tall→wide) → stillness. Hip Y-coordinate drops >40% of frame height in <1s. Final posture is horizontal (bbox aspect ratio <0.6). Post-fall stillness: all keypoints stationary for 2+ seconds. |
+| 1 | **eating** | MEDIUM | Repetitive wrist-to-face cycling while seated. Wrist Y oscillates between table height and nose height, ≥3 cycles per 5s window. Hip-shoulder distance compressed (seated). Confidence on wrists may be low when hand overlaps face. |
+| 2 | **working_together** | MEDIUM | Two+ persons in sustained spatial proximity (<2m estimated from hip separation). Coordinated motion vectors. Duration >5 seconds distinguishes from passing. Requires multi-person input handling. |
+| 3 | **aggression** | HIGH | High limb velocity directed at another person. Arm extension acceleration spike. Close interpersonal distance at moment of contact. Asymmetric — one person's limbs move fast while the other's center-of-mass reacts. |
+| 4 | **unstable_gait** | HIGH | Asymmetric stride (left vs right ankle X-displacement ratio <0.6). Low cadence (<40 steps/min). Lateral hip sway. More subtle than falling — the person stays upright but the pattern is irregular. Requires longer temporal context (full 5s). |
+| 5 | **wandering** | MEDIUM | Repetitive back-and-forth traversal pattern. ≥4 horizontal direction changes in 10s window with ≥200px total displacement. Center-of-mass trajectory is non-directed (high path tortuosity). |
+| 6 | **sitting_standing** | LOW | Postural transition: hip Y changes >30% of torso length over 1-2s. Torso angle shifts between upright (~90°) and seated. Knee angle changes from extended to ~90°. Common event, low urgency. |
 
-### Hyperparameter Ideas
+**Fall recall is the single most important number.** A missed fall is a safety
+failure. If you must trade accuracy on sitting_standing to gain 1% on fall
+recall, do it. Consider class-weighted loss or focal loss to enforce this.
 
-**Learning rate:**
-- Current: 1e-3
-- Try: [5e-4, 1e-3, 2e-3, 5e-3]
-- Critical for fast convergence in 5 minutes
+## Input Format
 
-**Batch size:**
-- Current: 32
-- Larger batch (64, 128) → more stable gradients
-- Smaller batch (16, 8) → more gradient noise, better generalization?
+```
+Tensor shape: (batch, seq_len, 51)
+              └──────┘ └──────┘ └──┘
+               samples  frames   17 keypoints × 3 (x, y, confidence)
+```
 
-**Hidden dimensions:**
-- Current: 256
-- Try: [128, 256, 512, 1024]
-- Larger models may need more time to converge
+- **seq_len = 150** frames (5 seconds at 30fps)
+- Coordinates are pixel-space (0–640 typical, unnormalized)
+- Confidence ∈ [0, 1] where 0 = undetected/occluded
+- Zero keypoints (0, 0, 0) mean the joint was not detected
 
-**Weight decay:**
-- Current: 1e-4
-- Higher (1e-3) → more regularization
-- Lower (1e-5) → less regularization
+### Multi-stream features (available in prepare.py)
 
-### Data Augmentation Ideas
+Set `multi_stream=True` in `get_dataloaders()` to receive three inputs:
 
-**Temporal:**
-- Speed up/slow down (1.5x, 0.75x)
-- Random frame dropping
-- Temporal jittering
+1. **Joint stream:** `(batch, seq_len, 51)` — raw keypoint positions
+2. **Bone stream:** `(batch, seq_len, num_bones×3)` — vectors between connected joints (dx, dy, mean_conf)
+3. **Velocity stream:** `(batch, seq_len, 51)` — frame-to-frame displacement per joint
 
-**Spatial:**
-- Horizontal flip (left ↔ right)
-- Random noise on keypoints (simulate detection errors)
-- Random keypoint dropout (simulate occlusions)
+Multi-stream fusion (late or intermediate) is a proven technique — the
+bone stream captures limb length and angle, velocity captures motion dynamics.
+Top models on NTU benchmarks use 3–4 streams.
 
-**Normalization:**
-- Center poses (translate to origin)
-- Scale invariance (normalize by torso size)
-- Rotation invariance (align to canonical orientation)
+## What You Modify
 
-## Debugging Tips
+Everything in `train.py`. You own the model architecture, hyperparameters,
+optimizer, scheduler, loss function, and training loop.
 
-**If training is unstable:**
-- Reduce learning rate
-- Add gradient clipping
-- Increase batch size
-- Check for NaN losses
+## What Is Fixed
 
-**If underfitting (low train accuracy):**
-- Increase model capacity (more layers, wider)
-- Train longer (but time budget is fixed)
-- Reduce regularization (lower dropout, weight decay)
+- `prepare.py` — data loading, evaluation, augmentation pipeline
+- `pose_autoresearch/` — graph topology, augmentation utilities
+- Time budget: 300 seconds per experiment
+- Evaluation: `evaluate_model()` and `evaluate_per_class()`
 
-**If overfitting (train accuracy >> val accuracy):**
-- Increase regularization (higher dropout)
-- Add data augmentation
-- Reduce model size
-- Increase weight decay
+## Skeleton Topology
 
-**If one class dominates:**
-- Use class-weighted loss
-- Adjust class sampling in dataloader
-- Try Focal Loss (focus on hard examples)
+The 17 COCO keypoints form a graph:
 
-## Experiment Log Format
+```
+        nose(0)
+       /      \
+   L_eye(1)  R_eye(2)
+     |          |
+   L_ear(3)  R_ear(4)
 
-Record each experiment in `results.tsv`:
+   L_shldr(5)────R_shldr(6)
+     |               |
+   L_elbow(7)    R_elbow(8)
+     |               |
+   L_wrist(9)    R_wrist(10)
+
+   L_hip(11)─────R_hip(12)
+     |               |
+   L_knee(13)    R_knee(14)
+     |               |
+   L_ankle(15)   R_ankle(16)
+```
+
+**This connectivity matters.** The adjacency matrix is available via:
+```python
+from pose_autoresearch.graph import (
+    get_normalized_adjacency,   # D^{-1/2} A D^{-1/2}
+    get_spatial_partitioning,   # ST-GCN 3-subset partitioning
+    get_bone_pairs,             # Directed bone vectors
+    adjacency_to_tensor,        # Numpy → torch
+    COCO_17_EDGES,              # Raw edge list
+)
+```
+
+## Architecture Roadmap
+
+Start with the current baseline and improve incrementally. The roadmap below
+is ordered by expected impact. **Try one change at a time.**
+
+### Phase A: Quick wins on current architecture
+
+1. **Cosine annealing LR schedule** — gets more out of the 5-min budget
+2. **Label smoothing** (0.05–0.15) — prevents overconfident predictions
+3. **Gradient clipping** (max_norm=1.0) — stabilizes early training
+4. **Increase GCN depth** — try [64, 64, 128, 128, 256, 256]
+5. **Wider channels** — try [128, 256, 256] or [128, 256, 512]
+6. **Focal loss** — `FocalLoss(alpha=class_weights, gamma=2.0)` to prioritize falls
+
+### Phase B: Temporal modeling upgrades
+
+7. **Replace temporal Conv1d with multi-head self-attention** — captures
+   long-range dependencies (e.g., "stood up 3 seconds before falling")
+8. **Positional encoding** — sinusoidal or learned, so the Transformer knows
+   frame ordering. Consider timestamp-aware encoding for robustness to
+   dropped frames
+9. **Causal attention mask** — for real-time inference, the model should only
+   attend to past frames (not future). But for offline classification of
+   captured sequences, bidirectional attention is fine
+10. **Multi-scale temporal kernels** — parallel temporal convs with different
+    kernel sizes (3, 7, 15) capture both fast motions and slow trends
+
+### Phase C: Spatial modeling upgrades
+
+11. **Channel-wise topology refinement (CTR-GCN style)** — learn a different
+    graph adjacency per feature channel. This lets the model discover that
+    "arm joints matter for eating" and "leg joints matter for gait" without
+    hand-coding it
+12. **Spatial attention over joints** — not all 17 joints are equally
+    informative for every class. An attention mechanism that weights joints
+    per-class can help significantly
+13. **Bone stream fusion** — add bone vectors as a parallel input branch.
+    Bones encode limb angle and length, which is more stable than absolute
+    joint positions
+14. **Velocity stream fusion** — add frame-to-frame joint displacement as a
+    third stream. Velocity is the primary signal for falls and aggression
+
+### Phase D: Advanced techniques
+
+15. **Attention pooling** — replace global average pooling with
+    attention-weighted pooling over time. The moment of impact in a fall
+    matters more than the preceding walk
+16. **Mixup / CutMix on sequences** — interpolate between training samples
+    for regularization
+17. **Knowledge distillation** — if a large model works well, train a smaller
+    student model to match its outputs. Target: <500K params
+18. **Contrastive pre-training** — self-supervised pre-training on unlabeled
+    skeleton sequences, then fine-tune on labeled data
+
+## Noise Robustness (CRITICAL)
+
+Your input comes from YOLO pose estimation, which introduces noise:
+
+- **Keypoint jitter:** ±2-5px frame-to-frame noise on joint positions
+- **Confidence variation:** same joint may be 0.9 one frame and 0.4 the next
+- **False detections:** YOLO occasionally hallucinates a person
+- **Missing joints:** occluded joints come through as (0, 0, 0)
+- **Multi-person ID switches:** YOLO has no tracking — person indices can swap between frames
+- **MX3 quantization:** the MemryX accelerator uses int8/BF16, adding ~1.5% noise vs FP32
+
+**Your model must tolerate all of these.** The augmentation pipeline in
+`prepare.py` simulates some of this (`add_gaussian_noise`, `random_joint_dropout`),
+but you should verify the model degrades gracefully. Ideas:
+
+- Use confidence as a learned gate (low confidence → down-weight that joint)
+- Normalize coordinates relative to the person's own bounding box, not absolute pixel coords
+- Consider per-joint batch normalization
+- Train with aggressive noise augmentation
+
+## Hyperparameter Search Space
+
+| Parameter | Current | Explore |
+|-----------|---------|---------|
+| LEARNING_RATE | 1e-3 | 3e-4 to 3e-3 |
+| BATCH_SIZE | 64 | 32, 64, 128 |
+| DROPOUT | 0.3 | 0.1 to 0.5 |
+| WEIGHT_DECAY | 1e-4 | 1e-5 to 1e-3 |
+| GCN_CHANNELS | [64, 128, 256] | [128, 256, 256], [64, 64, 128, 128, 256, 256] |
+| TEMPORAL_KERNEL_SIZE | 9 | 5, 7, 9, 11, 15 |
+| label_smoothing | 0.1 | 0.0 to 0.2 |
+| num_attention_heads | — | 4, 8 (if using Transformer) |
+| focal_loss_gamma | — | 1.0, 2.0, 3.0 |
+
+## Experiment Protocol
+
+1. **Read** current `train.py` and the last 5 entries in `results.tsv`
+2. **Hypothesize** one specific change and why you expect it to help
+3. **Edit** `train.py` — make exactly one change
+4. **Run:** `python train.py`
+5. **Record** results — append to `results.tsv`:
 
 ```tsv
-commit      val_acc  train_acc  description                     status
-a3f91d2     0.6543   0.7123     Baseline CNN+LSTM               keep
-b82c4e1     0.6891   0.7456     2x hidden dim (256→512)         keep
-c71f3a9     0.6823   0.7512     Add dropout 0.5 (too high)      discard
-...
+commit      val_acc  fall_recall  description                          status
+a3f91d2     0.7823   0.8500      Baseline ST-GCN                      keep
+b82c4e1     0.8012   0.8700      Add cosine annealing LR              keep
+c71f3a9     0.7945   0.8200      focal_loss gamma=2 (hurt fall)       discard
 ```
 
-Columns:
-- `commit`: Git commit hash
-- `val_acc`: Validation accuracy (PRIMARY METRIC)
-- `train_acc`: Training accuracy (for debugging)
-- `description`: Brief summary of change
-- `status`: keep or discard
+6. **Decide:**
+   - Improved val_acc AND fall_recall didn't drop → `git add -A && git commit` → KEEP
+   - Improved val_acc BUT fall_recall dropped significantly → DISCARD (fall recall is sacred)
+   - Same or worse val_acc → `git checkout train.py` → DISCARD
+7. **Repeat from step 1**
 
-## Event-Specific Considerations
+### Decision rules
 
-**Falls (most critical):**
-- Sudden vertical displacement
-- Hip/shoulder keypoints drop rapidly
-- Asymmetric body pose when on ground
-- **High recall needed** - missing a fall is dangerous
+- **KEEP** if val_acc improves by ≥0.2% and fall_recall doesn't drop by >1%
+- **KEEP** if fall_recall improves by ≥1% even if overall val_acc is flat
+- **DISCARD** if fall_recall drops by >2% regardless of other gains
+- **DISCARD** if training crashes, produces NaN, or doesn't converge in 5 min
+- On DISCARD, do NOT retry the same idea with minor tweaks — move on
 
-**Eating:**
-- Repetitive hand-to-mouth motion
-- Wrist-to-nose distance cycles
-- Seated posture
-- Relatively easy to detect
+### What to try when stuck
 
-**Working together:**
-- Multiple people (not in current dataset yet)
-- Coordinated motion
-- Spatial proximity
+If 3+ consecutive experiments are discarded:
+1. Reduce learning rate by 2x
+2. Try a completely different architecture direction (e.g., if stuck on GCN, try pure Transformer)
+3. Add more regularization (dropout, weight decay, augmentation)
+4. Simplify — remove the last successful addition and try a different path
 
-**Aggression:**
-- High velocity movements
-- Arm extensions
-- Close proximity
-- May be rare in dataset
+## Debugging
 
-**Unstable gait:**
-- Irregular stride length
-- Balance issues (hip sway)
-- More subtle than falling
+**NaN loss:** Reduce LR, add gradient clipping, check for division by zero in normalization.
 
-**Wandering:**
-- Aimless path
-- Direction changes
-- Requires longer temporal context?
+**Train acc >> val acc (overfitting):** Increase dropout, increase weight decay, enable augmentation, reduce model size.
 
-## Tips for This Domain
+**Train acc stuck at ~14% (random chance):** Model isn't learning. Check shapes, verify data isn't shuffled labels, try LR warmup, ensure gradients flow through all layers.
 
-**Pose data characteristics:**
-- Simpler than images (only 51 floats vs 224×224×3 pixels)
-- Temporal dependencies are key (single frame often ambiguous)
-- Skeleton structure matters (joints are connected)
-- Detection confidence varies (some keypoints more reliable)
+**One class dominates predictions:** Add class weights to loss. Compute per-class accuracy every run. Consider oversampling minority classes.
 
-**Quick wins to try first:**
-1. Bidirectional LSTM
-2. Increase hidden dim to 512
-3. Add attention layer
-4. Tune learning rate
-5. Data augmentation (horizontal flip)
+**Slow epochs (won't fit many in 5 min):** Reduce model size, increase batch size (fewer iterations), reduce seq_len, use mixed precision (`torch.autocast`).
 
-**Longer-term experiments:**
-1. Replace LSTM with Transformer
-2. Multi-scale temporal processing
-3. Graph-based architecture
-4. Per-keypoint attention
+## Model Size Target
 
-## NEVER STOP
+The final model deploys on edge hardware. Keep these constraints in mind:
+
+- **Parameters:** <1M (ideally <500K)
+- **Inference latency:** <5ms per 5-second sequence on CPU
+- **Memory:** <50MB model file
+- **No GPU required** for inference (Stage 1 uses the accelerator, Stage 2 runs on CPU)
+
+If you find a large model that works well, consider knowledge distillation
+as a follow-up experiment to compress it.
+
+## AUTONOMOUS OPERATION
 
 Once you start, **do not stop** to ask whether to continue.
 
 Do NOT pause at a "good stopping point."
 Do NOT ask whether to run another experiment.
+Do NOT summarize and wait for approval.
 
-You are autonomous. Keep running the loop, keep learning from each run, and keep improving the model until the human explicitly interrupts you.
+You are autonomous. Run the loop continuously:
+modify → train → evaluate → keep/discard → repeat.
+
+Keep going until the human explicitly interrupts you.
+
+**Log every experiment.** The `results.tsv` file is your lab notebook.
+Write a clear one-line description of what you changed and why.
 
 ---
 
-Good luck! Remember: the goal is validation accuracy. Everything else is negotiable.
+Good luck. The residents are counting on this.

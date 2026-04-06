@@ -1,13 +1,13 @@
 [project]
 name = "pose-autoresearch"
-version = "0.1.0"
+version = "0.2.0"
 description = "Autonomous research for pose-based event detection"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
     "torch>=2.0.0",
     "numpy>=1.24.0",
-    "ultralytics>=8.0.0",  # For YOLO26 pose estimation
+    "ultralytics>=8.0.0",  # For YOLO pose estimation
 ]
 
 [project.optional-dependencies]
@@ -16,6 +16,8 @@ dev = [
     "jupyter",
     "matplotlib",
     "seaborn",
+    "pytest",
+    "pytest-cov",
 ]
 
 [build-system]

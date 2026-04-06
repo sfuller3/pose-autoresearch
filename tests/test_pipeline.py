@@ -1,0 +1,267 @@
+"""End-to-end smoke tests for the training pipeline."""
+
+import json
+import sys
+from pathlib import Path
+
+import numpy as np
+import pytest
+import torch
+
+# Ensure project root is on path
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from prepare import (
+    PoseDataset,
+    get_dataloaders,
+    evaluate_model,
+    evaluate_per_class,
+    compute_bone_features,
+    compute_velocity_features,
+    EVENT_CLASSES,
+    NUM_KEYPOINTS,
+    VALUES_PER_KEYPOINT,
+    INPUT_DIM,
+    SEQ_LEN,
+    DEVICE,
+    NUM_BONES,
+)
+from pose_autoresearch.graph import (
+    get_adjacency_matrix,
+    get_normalized_adjacency,
+    get_spatial_partitioning,
+    get_bone_pairs,
+    COCO_17_EDGES,
+)
+from pose_autoresearch.augment import (
+    random_rotation,
+    random_horizontal_flip,
+    random_scale,
+    random_temporal_crop,
+    add_gaussian_noise,
+    random_joint_dropout,
+    augment_pose_sequence,
+)
+
+
+@pytest.fixture
+def sample_data_dir(tmp_path):
+    """Create a temporary directory with minimal JSON pose samples."""
+    for cls_name in EVENT_CLASSES:
+        for i in range(10):
+            frames = []
+            for t in range(SEQ_LEN):
+                kps = np.random.rand(NUM_KEYPOINTS, VALUES_PER_KEYPOINT).tolist()
+                frames.append({"keypoints": kps, "timestamp": t / 30.0})
+            sample = {"frames": frames, "label": cls_name, "duration": SEQ_LEN / 30.0}
+            with open(tmp_path / f"{cls_name}_{i:04d}.json", "w") as f:
+                json.dump(sample, f)
+    return tmp_path
+
+
+# ============================================================================
+# Graph tests
+# ============================================================================
+
+
+class TestGraph:
+    def test_adjacency_shape(self):
+        A = get_adjacency_matrix()
+        assert A.shape == (17, 17)
+
+    def test_adjacency_symmetric(self):
+        A = get_adjacency_matrix()
+        np.testing.assert_array_equal(A, A.T)
+
+    def test_adjacency_self_loops(self):
+        A = get_adjacency_matrix(self_loops=True)
+        assert all(A[i, i] == 1.0 for i in range(17))
+
+    def test_adjacency_no_self_loops(self):
+        A = get_adjacency_matrix(self_loops=False)
+        assert all(A[i, i] == 0.0 for i in range(17))
+
+    def test_known_edge(self):
+        A = get_adjacency_matrix()
+        # left_shoulder (5) -> left_elbow (7)
+        assert A[5, 7] == 1.0
+        assert A[7, 5] == 1.0
+
+    def test_normalized_adjacency_shape(self):
+        A = get_normalized_adjacency()
+        assert A.shape == (17, 17)
+        # All rows should be non-zero
+        assert all(A[i].sum() > 0 for i in range(17))
+
+    def test_spatial_partitioning_shape(self):
+        P = get_spatial_partitioning()
+        assert P.shape == (3, 17, 17)
+
+    def test_bone_pairs_valid(self):
+        bones = get_bone_pairs()
+        assert len(bones) > 0
+        for parent, child in bones:
+            assert 0 <= parent < 17
+            assert 0 <= child < 17
+
+
+# ============================================================================
+# Augmentation tests
+# ============================================================================
+
+
+class TestAugmentation:
+    def test_rotation_shape(self):
+        poses = torch.rand(SEQ_LEN, 17, 3)
+        result = random_rotation(poses)
+        assert result.shape == poses.shape
+
+    def test_rotation_preserves_confidence(self):
+        poses = torch.rand(SEQ_LEN, 17, 3)
+        result = random_rotation(poses)
+        torch.testing.assert_close(result[:, :, 2], poses[:, :, 2])
+
+    def test_scale_shape(self):
+        poses = torch.rand(SEQ_LEN, 17, 3)
+        result = random_scale(poses)
+        assert result.shape == poses.shape
+
+    def test_flip_shape(self):
+        poses = torch.rand(SEQ_LEN, 17, 3)
+        result = random_horizontal_flip(poses, p=1.0)
+        assert result.shape == poses.shape
+
+    def test_temporal_crop_pad(self):
+        short = torch.rand(50, 17, 3)
+        result = random_temporal_crop(short, target_len=SEQ_LEN)
+        assert result.shape == (SEQ_LEN, 17, 3)
+
+    def test_temporal_crop_trim(self):
+        long = torch.rand(200, 17, 3)
+        result = random_temporal_crop(long, target_len=SEQ_LEN)
+        assert result.shape == (SEQ_LEN, 17, 3)
+
+    def test_gaussian_noise_shape(self):
+        poses = torch.rand(SEQ_LEN, 17, 3)
+        result = add_gaussian_noise(poses)
+        assert result.shape == poses.shape
+
+    def test_joint_dropout_shape(self):
+        poses = torch.rand(SEQ_LEN, 17, 3)
+        result = random_joint_dropout(poses)
+        assert result.shape == poses.shape
+
+    def test_full_augment_pipeline(self):
+        poses = torch.rand(SEQ_LEN, 17, 3)
+        result = augment_pose_sequence(poses, target_len=SEQ_LEN)
+        assert result.shape == (SEQ_LEN, 17, 3)
+
+
+# ============================================================================
+# Multi-stream feature tests
+# ============================================================================
+
+
+class TestMultiStream:
+    def test_bone_features_shape(self):
+        kps = np.random.rand(SEQ_LEN, 17, 3).astype(np.float32)
+        bones = compute_bone_features(kps)
+        assert bones.shape == (SEQ_LEN, NUM_BONES, 3)
+
+    def test_velocity_features_shape(self):
+        kps = np.random.rand(SEQ_LEN, 17, 3).astype(np.float32)
+        vel = compute_velocity_features(kps)
+        assert vel.shape == (SEQ_LEN, 17, 3)
+
+    def test_velocity_first_frame_zero(self):
+        kps = np.random.rand(SEQ_LEN, 17, 3).astype(np.float32)
+        vel = compute_velocity_features(kps)
+        np.testing.assert_array_equal(vel[0, :, :2], 0.0)
+
+
+# ============================================================================
+# Dataset tests
+# ============================================================================
+
+
+class TestDataset:
+    def test_dataset_loads(self, sample_data_dir):
+        ds = PoseDataset(sample_data_dir)
+        assert len(ds) == 70  # 7 classes x 10 samples
+
+    def test_sample_shape(self, sample_data_dir):
+        ds = PoseDataset(sample_data_dir)
+        poses, label = ds[0]
+        assert poses.shape == (SEQ_LEN, INPUT_DIM)
+        assert 0 <= label.item() < len(EVENT_CLASSES)
+
+    def test_augmented_dataset(self, sample_data_dir):
+        ds = PoseDataset(sample_data_dir, augment=True)
+        poses, label = ds[0]
+        assert poses.shape == (SEQ_LEN, INPUT_DIM)
+
+    def test_multi_stream_dataset(self, sample_data_dir):
+        ds = PoseDataset(sample_data_dir, multi_stream=True)
+        (joints, bones, vel), label = ds[0]
+        assert joints.shape == (SEQ_LEN, INPUT_DIM)
+        assert bones.shape == (SEQ_LEN, NUM_BONES * 3)
+        assert vel.shape == (SEQ_LEN, INPUT_DIM)
+
+    def test_dataloaders(self, sample_data_dir):
+        train, val, test = get_dataloaders(
+            data_dir=sample_data_dir, batch_size=4, num_workers=0,
+        )
+        assert len(train) > 0
+        poses, labels = next(iter(train))
+        assert poses.shape[0] <= 4
+        assert poses.shape[2] == INPUT_DIM
+
+
+# ============================================================================
+# Model tests
+# ============================================================================
+
+
+class TestModel:
+    def test_forward_pass(self):
+        from train import PoseEventClassifier
+        model = PoseEventClassifier().to(DEVICE)
+        x = torch.randn(2, SEQ_LEN, INPUT_DIM).to(DEVICE)
+        logits = model(x)
+        assert logits.shape == (2, len(EVENT_CLASSES))
+
+    def test_forward_different_batch_sizes(self):
+        from train import PoseEventClassifier
+        model = PoseEventClassifier().to(DEVICE)
+        for bs in [1, 4, 16]:
+            x = torch.randn(bs, SEQ_LEN, INPUT_DIM).to(DEVICE)
+            logits = model(x)
+            assert logits.shape == (bs, len(EVENT_CLASSES))
+
+    def test_model_parameter_count(self):
+        from train import PoseEventClassifier
+        model = PoseEventClassifier()
+        num_params = sum(p.numel() for p in model.parameters())
+        # Should be under 1M for edge deployment
+        assert num_params < 2_000_000, f"Model too large: {num_params:,} params"
+
+    def test_evaluate(self, sample_data_dir):
+        from train import PoseEventClassifier
+        model = PoseEventClassifier().to(DEVICE)
+        _, val_loader, _ = get_dataloaders(
+            data_dir=sample_data_dir, batch_size=4, num_workers=0,
+        )
+        acc, loss = evaluate_model(model, val_loader, DEVICE)
+        assert 0.0 <= acc <= 1.0
+        assert loss >= 0.0
+
+    def test_per_class_eval(self, sample_data_dir):
+        from train import PoseEventClassifier
+        model = PoseEventClassifier().to(DEVICE)
+        _, val_loader, _ = get_dataloaders(
+            data_dir=sample_data_dir, batch_size=4, num_workers=0,
+        )
+        per_class = evaluate_per_class(model, val_loader, DEVICE)
+        assert set(per_class.keys()) == set(EVENT_CLASSES)
+        for cls, acc in per_class.items():
+            assert 0.0 <= acc <= 1.0

@@ -102,7 +102,7 @@ def main():
         required=True,
         help="Event label for these videos",
     )
-    args = args.parse_args()
+    args = parser.parse_args()
     
     # Load YOLO model
     print(f"Loading YOLO model: {args.model}")
