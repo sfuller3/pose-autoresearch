@@ -31,6 +31,7 @@ import argparse
 import csv
 import json
 import subprocess
+import sys
 import tempfile
 from collections import defaultdict
 from pathlib import Path
@@ -272,103 +273,174 @@ def extract_poses_from_video(
     return segment_frames(all_frames, seq_len, overlap, fps)
 
 
-def convert_le2i(
-    data_dir: Path,
-    output_dir: Path,
-    model,
-    seq_len: int = 150,
-    fps: int = 30,
-) -> int:
-    """Convert Le2i dataset videos to pose JSON.
-
-    Le2i structure (from Kaggle):
-        data/raw/le2i/Coffee_room_01/Coffee_room_01/Videos/*.avi
-        data/raw/le2i/Home_01/Home_01/Videos/*.avi
-        data/raw/le2i/Lecture_room/Lecture room/*.avi
-        ...
-
-    Label inference:
-        - Videos in directories/filenames containing 'fall' or 'chute' = fall
-        - Le2i annotation files have fall frame ranges, but for simplicity
-          we label entire short clips
-    """
-    count = 0
-
-    # Find all video files (handles spaces in paths via Path objects)
-    videos = list(data_dir.rglob("*.avi")) + list(data_dir.rglob("*.mp4"))
-    print(f"  Found {len(videos)} videos in Le2i")
-
-    for i, video_path in enumerate(sorted(videos)):
-        # Determine label from path and filename
-        path_lower = str(video_path).lower()
-
-        # Le2i labels: most videos in the dataset are labeled by annotation files
-        # The dataset contains both fall and ADL (activities of daily living) videos
-        # Fall videos typically have lower numbers, ADL have higher numbers
-        # For now, we label all as "sitting_standing" (non-fall default)
-        # and rely on annotation files if available
-        label = "sitting_standing"
-
-        # Check for annotation files near the video
-        anno_dir = video_path.parent.parent
-        if "annotation" in str(anno_dir).lower():
-            anno_dir = video_path.parent
-
-        # Check common annotation patterns
-        for anno_pattern in ["Annotation*", "annotation*"]:
-            anno_dirs = list(video_path.parent.parent.glob(anno_pattern))
-            if not anno_dirs:
-                anno_dirs = list(video_path.parent.glob(anno_pattern))
+def _infer_le2i_label(video_path: Path, data_dir: Path) -> str:
+    """Infer fall/non-fall label for a Le2i video using annotation files."""
+    # Check for annotation files near the video
+    for anno_pattern in ["Annotation*", "annotation*"]:
+        # Look in sibling directories and parent sibling directories
+        for search_dir in [video_path.parent, video_path.parent.parent]:
+            anno_dirs = list(search_dir.glob(anno_pattern))
             for ad in anno_dirs:
-                # If annotation file exists for this video, it's a fall video
-                video_stem = video_path.stem.replace(" ", "")
                 anno_files = list(ad.glob(f"*{video_path.stem}*")) + list(ad.glob("*.txt"))
                 for af in anno_files:
                     try:
                         content = af.read_text().strip()
                         if content and any(c.isdigit() for c in content):
-                            # Annotation file with frame numbers = fall video
-                            label = "fall"
-                            break
+                            return "fall"
                     except Exception:
                         pass
-                if label == "fall":
-                    break
+    return "sitting_standing"
 
-        # Determine scene from directory structure
-        # Go up to find the environment name
-        scene = "unknown"
-        for parent in video_path.parents:
-            if parent == data_dir:
-                break
-            name = parent.name
-            if name and name != "Videos" and not name.startswith("."):
-                scene = name.replace(" ", "_")
 
+def _infer_le2i_scene(video_path: Path, data_dir: Path) -> str:
+    """Determine the scene/environment name from the directory structure."""
+    for parent in video_path.parents:
+        if parent == data_dir:
+            break
+        name = parent.name
+        if name and name != "Videos" and not name.startswith("."):
+            return name.replace(" ", "_")
+    return "unknown"
+
+
+# Subprocess worker script for processing a single Le2i video.
+# This isolates each video so a corrupted file (C-level crash) doesn't
+# kill the entire conversion pipeline.
+_LE2I_WORKER_SCRIPT = '''
+import sys, json, numpy as np
+from pathlib import Path
+from ultralytics import YOLO
+
+video_path = Path(sys.argv[1])
+output_dir = Path(sys.argv[2])
+label = sys.argv[3]
+scene = sys.argv[4]
+seq_len = int(sys.argv[5])
+fps = int(sys.argv[6])
+model_name = sys.argv[7]
+
+model = YOLO(model_name)
+results = model(str(video_path), stream=True, verbose=False)
+
+all_frames = []
+frame_idx = 0
+for result in results:
+    if result.keypoints is not None and len(result.keypoints) > 0:
         try:
-            sequences = extract_poses_from_video(video_path, model, seq_len, fps)
-        except Exception as e:
-            print(f"    Error: {video_path.name}: {e}")
-            continue
+            kp_xy = result.keypoints.xy[0].cpu().numpy()
+            kp_conf = result.keypoints.conf[0].cpu().numpy()
+            keypoints = np.concatenate([kp_xy, kp_conf[:, None]], axis=1).tolist()
+            all_frames.append({"keypoints": keypoints, "timestamp": frame_idx / fps})
+        except (IndexError, AttributeError):
+            pass
+    else:
+        all_frames.append({"keypoints": [[0.0, 0.0, 0.0]] * 17, "timestamp": frame_idx / fps})
+    frame_idx += 1
 
-        for seq_idx, frames in enumerate(sequences):
-            sample = {
-                "frames": frames,
-                "label": label,
-                "duration": len(frames) / fps,
-                "source": f"le2i/{scene}/{video_path.stem}",
-            }
+# Segment into sequences
+sequences = []
+stride = max(1, int(seq_len * 0.5))
+for start in range(0, len(all_frames) - seq_len + 1, stride):
+    sequences.append(all_frames[start:start + seq_len])
+if not sequences and all_frames:
+    while len(all_frames) < seq_len:
+        all_frames.append({"keypoints": [[0.0, 0.0, 0.0]] * 17, "timestamp": len(all_frames) / fps})
+    sequences.append(all_frames[:seq_len])
 
-            # Sanitize filename (handle spaces)
-            safe_stem = video_path.stem.replace(" ", "_").replace("(", "").replace(")", "")
-            safe_scene = scene.replace(" ", "_")
-            filename = f"le2i_{label}_{safe_scene}_{safe_stem}_{seq_idx:04d}.json"
-            with open(output_dir / filename, "w") as f:
-                json.dump(sample, f)
-            count += 1
+# Save
+count = 0
+safe_stem = video_path.stem.replace(" ", "_").replace("(", "").replace(")", "")
+safe_scene = scene.replace(" ", "_")
+for seq_idx, frames in enumerate(sequences):
+    sample = {
+        "frames": frames,
+        "label": label,
+        "duration": len(frames) / fps,
+        "source": f"le2i/{scene}/{video_path.stem}",
+    }
+    filename = f"le2i_{label}_{safe_scene}_{safe_stem}_{seq_idx:04d}.json"
+    with open(output_dir / filename, "w") as f:
+        json.dump(sample, f)
+    count += 1
 
-        if sequences:
-            print(f"    [{i+1}/{len(videos)}] {video_path.name}: {len(sequences)} seq -> {label}")
+print(json.dumps({"count": count, "frames": frame_idx}))
+'''
+
+
+def convert_le2i(
+    data_dir: Path,
+    output_dir: Path,
+    model_name: str = "yolo11s-pose.pt",
+    seq_len: int = 150,
+    fps: int = 30,
+) -> int:
+    """Convert Le2i dataset videos to pose JSON.
+
+    Each video is processed in a separate subprocess to survive corrupted
+    files that cause C-level crashes (munmap_chunk, realloc errors).
+
+    Le2i structure (from Kaggle):
+        data/raw/le2i/Coffee_room_01/Coffee_room_01/Videos/*.avi
+        data/raw/le2i/Home_01/Home_01/Videos/*.avi
+        data/raw/le2i/Lecture_room/Lecture room/*.avi
+    """
+    count = 0
+    errors = 0
+
+    videos = list(data_dir.rglob("*.avi")) + list(data_dir.rglob("*.mp4"))
+    print(f"  Found {len(videos)} videos in Le2i")
+    print(f"  Processing each video in isolated subprocess (crash-safe)...")
+
+    # Write worker script to temp file
+    import tempfile
+    worker_file = Path(tempfile.mktemp(suffix=".py"))
+    worker_file.write_text(_LE2I_WORKER_SCRIPT)
+
+    try:
+        for i, video_path in enumerate(sorted(videos)):
+            label = _infer_le2i_label(video_path, data_dir)
+            scene = _infer_le2i_scene(video_path, data_dir)
+
+            try:
+                result = subprocess.run(
+                    [
+                        sys.executable, str(worker_file),
+                        str(video_path), str(output_dir),
+                        label, scene, str(seq_len), str(fps), model_name,
+                    ],
+                    capture_output=True, text=True, timeout=120,
+                )
+
+                if result.returncode == 0:
+                    # Parse the last line of stdout for the count
+                    lines = result.stdout.strip().split("\n")
+                    for line in reversed(lines):
+                        try:
+                            info = json.loads(line)
+                            n = info.get("count", 0)
+                            count += n
+                            print(f"    [{i+1}/{len(videos)}] {video_path.name}: "
+                                  f"{n} seq, {info.get('frames', '?')} frames -> {label}")
+                            break
+                        except json.JSONDecodeError:
+                            continue
+                else:
+                    errors += 1
+                    stderr_short = result.stderr.strip()[-200:] if result.stderr else "no stderr"
+                    print(f"    [{i+1}/{len(videos)}] {video_path.name}: CRASHED (rc={result.returncode}) {stderr_short}")
+
+            except subprocess.TimeoutExpired:
+                errors += 1
+                print(f"    [{i+1}/{len(videos)}] {video_path.name}: TIMEOUT (>120s)")
+            except Exception as e:
+                errors += 1
+                print(f"    [{i+1}/{len(videos)}] {video_path.name}: ERROR: {e}")
+
+    finally:
+        worker_file.unlink(missing_ok=True)
+
+    if errors:
+        print(f"  ⚠ {errors} videos failed (corrupted or timed out)")
 
     return count
 
@@ -431,13 +503,9 @@ def main():
         le2i_dir = Path("data/raw/le2i")
         if le2i_dir.exists():
             print(f"\nConverting Le2i from {le2i_dir}...")
+            print(f"  YOLO model: {args.model} (loaded per-subprocess)")
 
-            # Only load YOLO for Le2i (video processing)
-            from ultralytics import YOLO
-            print(f"Loading YOLO model: {args.model}")
-            model = YOLO(args.model)
-
-            n = convert_le2i(le2i_dir, args.output, model, args.seq_len, args.fps)
+            n = convert_le2i(le2i_dir, args.output, args.model, args.seq_len, args.fps)
             total += n
             print(f"Le2i: {n} sequences\n")
         else:
