@@ -46,7 +46,11 @@ FPS = 30
 MAX_TIME_BUDGET_SECONDS = int(os.environ.get("POSE_AUTORESEARCH_MAX_TIME", "300"))
 TRAIN_VAL_TEST_SPLIT = (0.7, 0.15, 0.15)
 
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+_force_device = os.environ.get("POSE_DEVICE", "").strip().lower()
+if _force_device:
+    DEVICE = torch.device(_force_device)
+else:
+    DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 DATA_DIR = Path("data")
 PROCESSED_DIR = DATA_DIR / "processed"
