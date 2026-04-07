@@ -11,26 +11,27 @@
 #   1. Install Thunder CLI:
 #      curl -fsSL https://raw.githubusercontent.com/Thunder-Compute/thunder-cli/main/scripts/install.sh | bash
 #
-#   2. Login & create instance:
+#   2. Login & create A6000 instance ($0.27/hr):
 #      tnr login
 #      tnr create --gpu a6000
 #
-#   3. Upload video data:
+#   3. Connect and run (datasets download automatically):
 #      tnr connect <instance-id>
-#      # Then from another terminal:
-#      rsync -avP data/raw/ <thunder-ssh>:pose-autoresearch/data/raw/
-#
-#   4. On the Thunder instance:
 #      git clone https://github.com/sfuller3/pose-autoresearch.git
 #      cd pose-autoresearch
-#      chmod +x scripts/setup_thunder.sh
 #      ./scripts/setup_thunder.sh
 #
-#   5. Launch autoresearch:
+#      NOTE: Le2i requires a Kaggle API token. Before running setup:
+#        mkdir -p ~/.kaggle
+#        echo '{"username":"YOUR_USER","key":"YOUR_KEY"}' > ~/.kaggle/kaggle.json
+#        chmod 600 ~/.kaggle/kaggle.json
+#      Get your token at: https://www.kaggle.com/settings → Create New API Token
+#
+#   4. Launch autoresearch:
 #      ./run_autoresearch.sh
 #
-#   6. When done, snapshot before stopping:
-#      # Use Thunder console or CLI to create snapshot
+#   5. When done, snapshot before stopping:
+#      tnr snapshot <instance-id>
 #      tnr stop <instance-id>
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
@@ -187,22 +188,27 @@ elif [ "$RAW_VIDEO_COUNT" -gt "0" ]; then
     NEW_COUNT=$(find data/processed -name "*.json" 2>/dev/null | wc -l | tr -d ' ')
     echo "  ✓ Extracted $NEW_COUNT pose sequences."
 else
-    echo "  No video data found. Generating synthetic data for smoke test..."
-    python3 prepare.py --dataset synthetic
+    echo "  No data found. Downloading datasets..."
     echo ""
-    echo "  ┌─────────────────────────────────────────────────────────────┐"
-    echo "  │ To use real data, upload videos from your Mac:              │"
-    echo "  │                                                             │"
-    echo "  │   rsync -avP data/raw/ <thunder-ssh>:pose-autoresearch/data/raw/  │"
-    echo "  │                                                             │"
-    echo "  │ Expected structure:                                         │"
-    echo "  │   data/raw/fallvision/fall/*.mp4                            │"
-    echo "  │   data/raw/fallvision/nofall/*.mp4                          │"
-    echo "  │   data/raw/le2i/Coffee_room/fall/*.avi                      │"
-    echo "  │   data/raw/le2i/Coffee_room/not_fall/*.avi                  │"
-    echo "  │                                                             │"
-    echo "  │ Then rerun: ./scripts/setup_thunder.sh                      │"
-    echo "  └─────────────────────────────────────────────────────────────┘"
+    ./scripts/download_data.sh all
+
+    # Re-check for videos after download
+    RAW_VIDEO_COUNT=$(find data/raw -type f \( -name "*.mp4" -o -name "*.avi" -o -name "*.mov" \) 2>/dev/null | wc -l | tr -d ' ')
+    if [ "$RAW_VIDEO_COUNT" -gt "0" ]; then
+        echo ""
+        echo "  Found $RAW_VIDEO_COUNT videos. Extracting poses..."
+        if [ "$HAS_GPU" = true ]; then
+            echo "  (GPU-accelerated — ~5-15s per video)"
+        else
+            echo "  (CPU mode — ~1-3min per video)"
+        fi
+        time python3 scripts/convert_fallvision.py --source all
+        NEW_COUNT=$(find data/processed -name "*.json" 2>/dev/null | wc -l | tr -d ' ')
+        echo "  ✓ Extracted $NEW_COUNT pose sequences."
+    else
+        echo "  Download may have failed. Generating synthetic data for smoke test..."
+        python3 prepare.py --dataset synthetic
+    fi
 fi
 echo ""
 
