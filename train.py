@@ -22,11 +22,6 @@ from prepare import (
     MAX_TIME_BUDGET_SECONDS,
     NUM_KEYPOINTS,
 )
-from pose_autoresearch.graph import (
-    get_normalized_adjacency,
-    adjacency_to_tensor,
-    COCO_17_EDGES,
-)
 
 # ============================================================================
 # HYPERPARAMETERS (agent can modify)
@@ -41,140 +36,48 @@ BATCH_SIZE = 64
 LEARNING_RATE = 1e-3
 WEIGHT_DECAY = 1e-4
 DROPOUT = 0.3
-GCN_CHANNELS = [64, 128, 256]  # Graph conv channel progression
-TEMPORAL_KERNEL_SIZE = 9        # Temporal conv kernel size
 
 # ============================================================================
-# GRAPH CONVOLUTION BLOCK
+# MODEL: Lightweight 1D Temporal CNN
 # ============================================================================
 
 
-class SpatialGraphConv(nn.Module):
-    """Single spatial graph convolution layer.
+class TemporalBlock(nn.Module):
+    """1D temporal convolution block with residual connection."""
 
-    Applies graph convolution: H' = A_norm @ H @ W
-    """
-
-    def __init__(self, in_channels: int, out_channels: int, A: torch.Tensor):
+    def __init__(self, in_ch, out_ch, kernel_size=7, stride=1, dropout=0.3):
         super().__init__()
-        self.register_buffer("A", A)  # (num_joints, num_joints)
-        self.W = nn.Linear(in_channels, out_channels, bias=False)
-        self.bn = nn.BatchNorm1d(out_channels * A.shape[0])
-
-    def forward(self, x):
-        """
-        Args:
-            x: (batch, seq_len, num_joints, channels)
-        Returns:
-            (batch, seq_len, num_joints, out_channels)
-        """
-        B, T, V, C = x.shape
-
-        # Graph convolution: aggregate neighbor features
-        x = torch.einsum("btvc,vw->btwc", x, self.A)
-
-        # Linear transform
-        x = self.W(x)
-
-        # Batch norm
-        C_out = x.shape[-1]
-        x = x.reshape(B * T, V * C_out)
-        x = self.bn(x)
-        x = x.reshape(B, T, V, C_out)
-
-        return x
-
-
-class STGCNBlock(nn.Module):
-    """Spatial-Temporal Graph Convolution block.
-
-    1. Spatial graph conv (inter-joint relationships)
-    2. Temporal conv (intra-joint motion over time)
-    3. Residual connection
-    """
-
-    def __init__(
-        self,
-        in_channels: int,
-        out_channels: int,
-        A: torch.Tensor,
-        temporal_kernel: int = 9,
-        stride: int = 1,
-        dropout: float = 0.0,
-    ):
-        super().__init__()
-
-        self.spatial = SpatialGraphConv(in_channels, out_channels, A)
-
-        pad = (temporal_kernel - 1) // 2
-        self.temporal = nn.Sequential(
-            nn.Conv2d(out_channels, out_channels, (temporal_kernel, 1),
-                      stride=(stride, 1), padding=(pad, 0)),
-            nn.BatchNorm2d(out_channels),
-        )
-
-        self.relu = nn.ReLU(inplace=True)
+        pad = (kernel_size - 1) // 2
+        self.conv1 = nn.Conv1d(in_ch, out_ch, kernel_size, stride=stride, padding=pad)
+        self.bn1 = nn.BatchNorm1d(out_ch)
+        self.conv2 = nn.Conv1d(out_ch, out_ch, kernel_size, padding=pad)
+        self.bn2 = nn.BatchNorm1d(out_ch)
         self.dropout = nn.Dropout(dropout)
+        self.relu = nn.ReLU(inplace=True)
 
-        if in_channels != out_channels or stride != 1:
+        if in_ch != out_ch or stride != 1:
             self.residual = nn.Sequential(
-                nn.Conv2d(in_channels, out_channels, 1, stride=(stride, 1)),
-                nn.BatchNorm2d(out_channels),
+                nn.Conv1d(in_ch, out_ch, 1, stride=stride),
+                nn.BatchNorm1d(out_ch),
             )
         else:
             self.residual = nn.Identity()
 
     def forward(self, x):
-        """
-        Args:
-            x: (batch, seq_len, num_joints, in_channels)
-        Returns:
-            (batch, seq_len, num_joints, out_channels)
-        """
-        # Residual: reshape to (B, C, T, V) for Conv2d
-        res = x.permute(0, 3, 1, 2)
-        res = self.residual(res)
-
-        # Spatial graph conv
-        x = self.spatial(x)
-        x = self.relu(x)
-
-        # Temporal conv: (B, C_out, T, V)
-        x = x.permute(0, 3, 1, 2)
-        x = self.temporal(x)
-
-        # Residual + activate
-        x = x + res
-        x = self.relu(x)
+        # x: (B, C, T)
+        res = self.residual(x)
+        x = self.relu(self.bn1(self.conv1(x)))
         x = self.dropout(x)
-
-        # Back to (B, T, V, C)
-        x = x.permute(0, 2, 3, 1)
+        x = self.bn2(self.conv2(x))
+        x = self.relu(x + res)
         return x
 
 
-# ============================================================================
-# MODEL
-# ============================================================================
-
-
 class PoseEventClassifier(nn.Module):
-    """Spatial-Temporal GCN for pose event classification.
+    """Lightweight 1D temporal CNN for pose event classification.
 
-    Architecture:
-    1. Input projection: (x, y, conf) per joint -> feature channels
-    2. Stack of ST-GCN blocks with increasing channels
-    3. Global average pooling over time and joints
-    4. Classification head
-
-    Agent: You can modify anything here. Ideas to try:
-    - Add attention (channel, temporal, or spatial)
-    - Try CTR-GCN style channel-wise topology refinement
-    - Replace temporal conv with Transformer encoder
-    - Multi-scale temporal kernels
-    - Multi-stream fusion (add bone/velocity inputs)
-    - Deeper or wider GCN blocks
-    - Different pooling strategies (attention pooling, max pooling)
+    Flattens all 51 keypoint features and applies temporal convolutions.
+    Much faster than ST-GCN on CPU while capturing temporal patterns.
     """
 
     def __init__(
@@ -183,28 +86,23 @@ class PoseEventClassifier(nn.Module):
         num_joints: int = NUM_JOINTS,
         num_classes: int = NUM_CLASSES,
         gcn_channels: list[int] | None = None,
-        temporal_kernel: int = TEMPORAL_KERNEL_SIZE,
+        temporal_kernel: int = 9,
         dropout: float = DROPOUT,
     ):
         super().__init__()
 
-        if gcn_channels is None:
-            gcn_channels = list(GCN_CHANNELS)
+        in_dim = num_joints * input_channels  # 51
 
-        A = adjacency_to_tensor(get_normalized_adjacency(COCO_17_EDGES, num_joints))
+        self.input_bn = nn.BatchNorm1d(in_dim)
 
-        self.input_bn = nn.BatchNorm1d(input_channels * num_joints)
+        self.blocks = nn.Sequential(
+            TemporalBlock(in_dim, 128, kernel_size=7, dropout=dropout),
+            TemporalBlock(128, 128, kernel_size=7, dropout=dropout),
+            TemporalBlock(128, 256, kernel_size=5, stride=2, dropout=dropout),
+            TemporalBlock(256, 256, kernel_size=5, dropout=dropout),
+        )
 
-        layers = []
-        in_ch = input_channels
-        for out_ch in gcn_channels:
-            layers.append(
-                STGCNBlock(in_ch, out_ch, A, temporal_kernel, dropout=dropout)
-            )
-            in_ch = out_ch
-
-        self.gcn_blocks = nn.ModuleList(layers)
-        self.fc = nn.Linear(gcn_channels[-1], num_classes)
+        self.fc = nn.Linear(256, num_classes)
 
     def forward(self, x):
         """
@@ -213,22 +111,17 @@ class PoseEventClassifier(nn.Module):
         Returns:
             logits: (batch, num_classes)
         """
-        B, T, _ = x.shape
-
-        # Reshape to (batch, seq_len, 17, 3)
-        x = x.view(B, T, NUM_JOINTS, INPUT_CHANNELS)
+        B, T, D = x.shape
 
         # Input normalization
-        x_flat = x.reshape(B * T, NUM_JOINTS * INPUT_CHANNELS)
-        x_flat = self.input_bn(x_flat)
-        x = x_flat.reshape(B, T, NUM_JOINTS, INPUT_CHANNELS)
+        x = x.permute(0, 2, 1)  # (B, 51, T)
+        x = self.input_bn(x)
 
-        # ST-GCN blocks
-        for block in self.gcn_blocks:
-            x = block(x)
+        # Temporal blocks
+        x = self.blocks(x)  # (B, 256, T')
 
-        # Global average pooling over time and joints
-        x = x.mean(dim=[1, 2])
+        # Global average pooling over time
+        x = x.mean(dim=2)  # (B, 256)
 
         # Classify
         logits = self.fc(x)
@@ -280,9 +173,7 @@ def main():
     print("POSE AUTORESEARCH - Training Run")
     print("=" * 70)
     print(f"Device: {DEVICE}")
-    print(f"Model: ST-GCN PoseEventClassifier")
-    print(f"GCN Channels: {GCN_CHANNELS}")
-    print(f"Temporal Kernel: {TEMPORAL_KERNEL_SIZE}")
+    print(f"Model: Temporal CNN")
     print(f"Batch Size: {BATCH_SIZE}")
     print(f"Learning Rate: {LEARNING_RATE}")
     print(f"Time Budget: {MAX_TIME_BUDGET_SECONDS}s")
@@ -298,8 +189,6 @@ def main():
     print()
 
     model = PoseEventClassifier(
-        gcn_channels=GCN_CHANNELS,
-        temporal_kernel=TEMPORAL_KERNEL_SIZE,
         dropout=DROPOUT,
     ).to(DEVICE)
 
@@ -315,7 +204,10 @@ def main():
         optimizer, T_max=50, eta_min=1e-6,
     )
 
-    criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
+    # Class weights: boost fall (class 0)
+    class_weights = torch.ones(NUM_CLASSES, device=DEVICE)
+    class_weights[0] = 1.5  # fall priority
+    criterion = nn.CrossEntropyLoss(weight=class_weights, label_smoothing=0.1)
 
     start_time = time.time()
     epoch = 0
