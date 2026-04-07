@@ -122,7 +122,8 @@ print(f"  PyTorch:   {torch.__version__}")
 if torch.cuda.is_available():
     print(f"  CUDA:      {torch.version.cuda}")
     print(f"  GPU:       {torch.cuda.get_device_name(0)}")
-    vram = torch.cuda.get_device_properties(0).total_mem / 1e9
+    props = torch.cuda.get_device_properties(0)
+    vram = (getattr(props, 'total_memory', None) or getattr(props, 'total_mem', 0)) / 1e9
     print(f"  VRAM:      {vram:.1f} GB")
 
     # GPU benchmark
