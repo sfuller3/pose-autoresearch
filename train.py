@@ -17,10 +17,12 @@ from prepare import (
     get_dataloaders,
     evaluate_model,
     evaluate_per_class,
+    BONE_PAIRS,
     DEVICE,
     EVENT_CLASSES,
     MAX_TIME_BUDGET_SECONDS,
     NUM_KEYPOINTS,
+    NUM_BONES,
 )
 
 # ============================================================================
@@ -28,6 +30,9 @@ from prepare import (
 # ============================================================================
 
 INPUT_DIM = 51       # 17 keypoints x 3 (x, y, confidence)
+BONE_DIM = NUM_BONES * 3  # 16 bones x 3 (dx, dy, mean_conf)
+VELOCITY_DIM = 51    # 17 keypoints x 3 (vx, vy, confidence)
+FULL_INPUT_DIM = INPUT_DIM + BONE_DIM + VELOCITY_DIM  # 51 + 48 + 51 = 150
 INPUT_CHANNELS = 3   # Per-joint: x, y, confidence
 NUM_JOINTS = NUM_KEYPOINTS  # 17
 NUM_CLASSES = len(EVENT_CLASSES)  # 7
@@ -91,7 +96,7 @@ class PoseEventClassifier(nn.Module):
     ):
         super().__init__()
 
-        in_dim = num_joints * input_channels  # 51
+        in_dim = FULL_INPUT_DIM  # joint(51) + bone(48) + velocity(51) = 150
 
         self.input_bn = nn.BatchNorm1d(in_dim)
 
@@ -113,8 +118,29 @@ class PoseEventClassifier(nn.Module):
         """
         B, T, D = x.shape
 
+        # Compute bone and velocity features in pure PyTorch (stays on GPU)
+        kps = x.view(B, T, NUM_JOINTS, 3)  # (B, T, 17, 3)
+
+        # Velocity: frame-to-frame displacement
+        vel = torch.zeros_like(kps)
+        vel[:, 1:, :, :2] = kps[:, 1:, :, :2] - kps[:, :-1, :, :2]
+        vel[:, :, :, 2] = kps[:, :, :, 2]  # keep confidence
+        vel_flat = vel.reshape(B, T, -1)  # (B, T, 51)
+
+        # Bones: vectors between connected joints
+        bone_parts = []
+        for parent, child in BONE_PAIRS:
+            dx = kps[:, :, child, 0] - kps[:, :, parent, 0]
+            dy = kps[:, :, child, 1] - kps[:, :, parent, 1]
+            conf = (kps[:, :, child, 2] + kps[:, :, parent, 2]) / 2
+            bone_parts.append(torch.stack([dx, dy, conf], dim=2))  # (B, T, 3)
+        bones_flat = torch.cat(bone_parts, dim=2)  # (B, T, 48)
+
+        # Concatenate joint + bone + velocity
+        x = torch.cat([x, bones_flat, vel_flat], dim=2)  # (B, T, 150)
+
         # Input normalization
-        x = x.permute(0, 2, 1)  # (B, 51, T)
+        x = x.permute(0, 2, 1)  # (B, 150, T)
         x = self.input_bn(x)
 
         # Temporal blocks
