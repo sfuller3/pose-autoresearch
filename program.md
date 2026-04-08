@@ -114,7 +114,7 @@ The 17 COCO keypoints form a graph:
    L_ankle(15)   R_ankle(16)
 ```
 
-**This connectivity matters.** The adjacency matrix is available via:
+The adjacency matrix is available via:
 ```python
 from pose_autoresearch.graph import (
     get_normalized_adjacency,   # D^{-1/2} A D^{-1/2}
@@ -125,59 +125,74 @@ from pose_autoresearch.graph import (
 )
 ```
 
-## Architecture Roadmap
+## Model Strategy: Enhanced Temporal CNN
 
-Start with the current baseline and improve incrementally. The roadmap below
-is ordered by expected impact. **Try one change at a time.**
+**Do NOT use graph convolutional networks (GCN/ST-GCN/CTR-GCN).** We tested
+ST-GCN and it performed significantly worse than a simple temporal CNN on our
+data (+7.3% accuracy gain when we switched away from ST-GCN). Here is why
+temporal CNNs are the right choice for this problem:
 
-### Phase A: Quick wins on current architecture
+1. **Our 7 classes are temporally distinctive** — falls are fast, wandering is
+   slow, eating is repetitive, sitting/standing is transitional. Temporal
+   patterns carry more signal than spatial joint graph topology.
+2. **YOLO 2D keypoints are noisy** — joints flicker and swap. Graph
+   convolutions propagate noise along skeleton edges, while flat temporal
+   CNNs are resilient to per-joint noise.
+3. **Conv1D is 3-5x faster on CPU** than graph convolution — critical for the
+   <5ms edge inference constraint.
+4. **With 24K samples and 7 classes** (vs NTU-120's 114K/120 classes), the
+   model can learn spatial joint relationships implicitly without graph
+   inductive bias.
+5. **Applied fall detection literature (2025) validates this** — the best
+   real-world elder-care systems use CNN/LSTM on 2D keypoints, not GCNs.
 
-1. **Cosine annealing LR schedule** — gets more out of the 5-min budget
-2. **Label smoothing** (0.05–0.15) — prevents overconfident predictions
-3. **Gradient clipping** (max_norm=1.0) — stabilizes early training
-4. **Increase GCN depth** — try [64, 64, 128, 128, 256, 256]
-5. **Wider channels** — try [128, 256, 256] or [128, 256, 512]
-6. **Focal loss** — `FocalLoss(alpha=class_weights, gamma=2.0)` to prioritize falls
+### How to improve the temporal CNN
 
-### Phase B: Temporal modeling upgrades
+The biggest gains come from **feature engineering and input enrichment**, not
+architecture changes. In priority order:
 
-7. **Replace temporal Conv1d with multi-head self-attention** — captures
-   long-range dependencies (e.g., "stood up 3 seconds before falling")
-8. **Positional encoding** — sinusoidal or learned, so the Transformer knows
-   frame ordering. Consider timestamp-aware encoding for robustness to
-   dropped frames
-9. **Causal attention mask** — for real-time inference, the model should only
-   attend to past frames (not future). But for offline classification of
-   captured sequences, bidirectional attention is fine
-10. **Multi-scale temporal kernels** — parallel temporal convs with different
-    kernel sizes (3, 7, 15) capture both fast motions and slow trends
+1. **Concatenate velocity + bone features as extra input channels.** Compute
+   frame-to-frame joint displacement (velocity) and bone vectors (differences
+   between connected joints) as preprocessing, expanding the input from 51 to
+   ~120 channels in a single forward pass. This gives multi-stream information
+   without multi-stream cost. Do NOT use separate model branches or 4-stream
+   fusion — that multiplies params and inference time by 4x.
 
-### Phase C: Spatial modeling upgrades
+2. **Add lightweight channel attention** (squeeze-and-excitation block, ~1-2K
+   extra params) so the model learns which joints/features matter per class
+   (e.g., wrists for eating, hips/ankles for gait).
 
-11. **Channel-wise topology refinement (CTR-GCN style)** — learn a different
-    graph adjacency per feature channel. This lets the model discover that
-    "arm joints matter for eating" and "leg joints matter for gait" without
-    hand-coding it
-12. **Spatial attention over joints** — not all 17 joints are equally
-    informative for every class. An attention mechanism that weights joints
-    per-class can help significantly
-13. **Bone stream fusion** — add bone vectors as a parallel input branch.
-    Bones encode limb angle and length, which is more stable than absolute
-    joint positions
-14. **Velocity stream fusion** — add frame-to-frame joint displacement as a
-    third stream. Velocity is the primary signal for falls and aggression
+3. **Use confidence as a learned gate** — multiply each joint's features by a
+   learned function of its YOLO confidence score, so noisy/missing joints are
+   automatically down-weighted.
 
-### Phase D: Advanced techniques
+4. **Multi-scale temporal kernels** — parallel Conv1d with kernel sizes
+   (3, 7, 15) in the same layer to capture both fast motions (falls) and
+   slow patterns (wandering) simultaneously.
 
-15. **Attention pooling** — replace global average pooling with
-    attention-weighted pooling over time. The moment of impact in a fall
-    matters more than the preceding walk
-16. **Mixup / CutMix on sequences** — interpolate between training samples
-    for regularization
-17. **Knowledge distillation** — if a large model works well, train a smaller
-    student model to match its outputs. Target: <500K params
-18. **Contrastive pre-training** — self-supervised pre-training on unlabeled
-    skeleton sequences, then fine-tune on labeled data
+5. **Attention pooling over time** — replace global average pooling with
+   attention-weighted pooling so the model focuses on the discriminative
+   moment (e.g., the instant of impact in a fall, not the preceding walk).
+
+### Architecture ideas to try (flat list, no stages)
+
+Pick whatever seems most promising given current results.
+**Try one change at a time. Do not pause between ideas.**
+
+1. **Input feature expansion** — concatenate velocity + bone vectors as extra
+   channels (highest expected impact for 7-class problem)
+2. **Focal loss** — `FocalLoss(alpha=class_weights, gamma=2.0)` to prioritize
+   fall recall
+3. **Multi-scale temporal kernels** — parallel convs at sizes (3, 7, 15)
+4. **Squeeze-and-excitation channel attention** — lightweight per-channel gating
+5. **Confidence gating** — learned down-weighting of low-confidence joints
+6. **Attention pooling** — replace GAP with attention-weighted temporal pooling
+7. **Shrink model if over budget** — target channels 51→96→96→128→128 for
+   ~400K params, well under the 1M limit
+8. **Mixup / CutMix on sequences** — temporal interpolation for regularization
+9. **Positional encoding** — sinusoidal or learned, if adding any attention
+10. **Knowledge distillation** — train a larger teacher model offline, distill
+    into the lightweight CNN for 2-3% accuracy recovery
 
 ## Noise Robustness (CRITICAL)
 
@@ -203,15 +218,16 @@ but you should verify the model degrades gracefully. Ideas:
 
 | Parameter | Current | Explore |
 |-----------|---------|---------|
-| LEARNING_RATE | 1e-3 | 3e-4 to 3e-3 |
+| LEARNING_RATE | 2e-3 | 3e-4 to 3e-3 |
 | BATCH_SIZE | 64 | 32, 64, 128 |
 | DROPOUT | 0.3 | 0.1 to 0.5 |
 | WEIGHT_DECAY | 1e-4 | 1e-5 to 1e-3 |
-| GCN_CHANNELS | [64, 128, 256] | [128, 256, 256], [64, 64, 128, 128, 256, 256] |
-| TEMPORAL_KERNEL_SIZE | 9 | 5, 7, 9, 11, 15 |
+| CNN_CHANNELS | [128, 128, 256, 256] | [96, 96, 128, 128], [64, 128, 128, 256] |
+| TEMPORAL_KERNEL_SIZE | 9 | 3, 5, 7, 9, 15 (or multi-scale) |
+| INPUT_FEATURES | 51 (joint only) | ~120 (joint + velocity + bone concat) |
 | label_smoothing | 0.1 | 0.0 to 0.2 |
-| num_attention_heads | — | 4, 8 (if using Transformer) |
 | focal_loss_gamma | — | 1.0, 2.0, 3.0 |
+| se_reduction | — | 4, 8, 16 (if using SE attention) |
 
 ## Experiment Protocol
 
@@ -276,19 +292,24 @@ as a follow-up experiment to compress it.
 
 ## AUTONOMOUS OPERATION
 
-Once you start, **do not stop** to ask whether to continue.
+**NEVER STOP. NEVER PAUSE. NEVER ASK.**
 
-Do NOT pause at a "good stopping point."
-Do NOT ask whether to run another experiment.
-Do NOT summarize and wait for approval.
+- Do NOT pause between ideas, between architecture changes, or at any "milestone"
+- Do NOT summarize progress and wait for approval
+- Do NOT ask whether to run another experiment
+- Do NOT announce you are "moving to the next phase" — there are no phases
+- Do NOT output long explanations between experiments — just log to results.tsv
+- After each experiment, immediately start the next one. Zero delay.
 
-You are autonomous. Run the loop continuously:
-modify → train → evaluate → keep/discard → repeat.
+You are fully autonomous. Run the loop continuously:
+hypothesize → edit → train → evaluate → keep/discard → repeat.
 
-Keep going until the human explicitly interrupts you.
+Keep going until the human explicitly interrupts you or you hit a hard
+blocker (crash, data error, disk full). Even then, try to fix it yourself
+before stopping.
 
-**Log every experiment.** The `results.tsv` file is your lab notebook.
-Write a clear one-line description of what you changed and why.
+**Log every experiment** in `results.tsv`. That is your only required output.
+Minimize text output between experiments — the TSV is your lab notebook.
 
 ---
 

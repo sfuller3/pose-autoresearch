@@ -53,7 +53,7 @@ class TemporalBlock(nn.Module):
         self.conv2 = nn.Conv1d(out_ch, out_ch, kernel_size, padding=pad)
         self.bn2 = nn.BatchNorm1d(out_ch)
         self.dropout = nn.Dropout(dropout)
-        self.relu = nn.ReLU(inplace=True)
+        self.act = nn.SiLU(inplace=True)
 
         if in_ch != out_ch or stride != 1:
             self.residual = nn.Sequential(
@@ -66,10 +66,10 @@ class TemporalBlock(nn.Module):
     def forward(self, x):
         # x: (B, C, T)
         res = self.residual(x)
-        x = self.relu(self.bn1(self.conv1(x)))
+        x = self.act(self.bn1(self.conv1(x)))
         x = self.dropout(x)
         x = self.bn2(self.conv2(x))
-        x = self.relu(x + res)
+        x = self.act(x + res)
         return x
 
 
