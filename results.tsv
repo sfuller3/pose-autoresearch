@@ -19,3 +19,12 @@ exp16	0.9718	0.9677	batch_size=32 (worse)	discard
 exp17	0.7522	0.9734	7-class baseline: temporal CNN on 24K samples (NTU+FV data), unstable_gait=0.7%, wandering=44.7%	keep
 exp18	0.9269	0.9809	Fix class mapping: no cross-class action overlap, add A042(stagger) for unstable_gait	keep
 exp19	0.9499	0.9730	Concat velocity+bone features as input channels (pure PyTorch GPU), 150-dim input	keep
+exp20	0.9465	0.9793	SE channel attention reduction=8 (slower, worse)	discard
+exp21	0.9443	0.9762	Focal loss gamma=2.0 (worse)	discard
+exp22	0.9402	0.9730	Multi-scale temporal kernels (3,7,15), 4.3M params (too heavy, worse)	discard
+exp23	0.9413	0.9746	lr=1e-3 bs=128 (converges too slowly)	discard
+exp24	0.9435	0.9634	Attention pooling (worse)	discard
+exp25	0.9465	0.9762	Smaller channels [96,96,192,192,192] 5 blocks 1.2M params (slightly worse)	discard
+exp26	0.9490	0.9730	dropout=0.4 (marginally worse val, better test)	discard
+exp27	0.9457	0.9793	dropout=0.35 (worse)	discard
+exp20	0.9465	0.9793	SE channel attention reduction=8 (slower, worse)	discard
