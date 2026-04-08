@@ -17,3 +17,4 @@ exp14	0.9744	0.9613	Hidden FC head with dropout (fall recall dropped)	discard
 exp15	0.9564	-	Multi-scale temporal conv (much worse)	discard
 exp16	0.9718	0.9677	batch_size=32 (worse)	discard
 exp17	0.7522	0.9734	7-class baseline: temporal CNN on 24K samples (NTU+FV data), unstable_gait=0.7%, wandering=44.7%	keep
+exp18	0.9269	0.9809	Fix class mapping: no cross-class action overlap, add A042(stagger) for unstable_gait	keep

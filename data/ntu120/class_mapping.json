@@ -1,9 +1,9 @@
 {
     "_description": "Maps NTU RGB+D 120 action classes to Vistarra event types",
-    "_ntu_format": "A001-A120 action labels",
+    "_ntu_format": "A001-A120 action labels (1-indexed)",
+    "_notes": "No action appears in multiple classes to avoid confusion",
     "fall": [
-        "A043:falling down",
-        "A044:stumbling"
+        "A043:falling down"
     ],
     "eating": [
         "A024:eat meal",
@@ -11,8 +11,9 @@
     ],
     "working_together": [
         "A057:handshaking",
-        "A058:walking towards",
-        "A059:walking apart"
+        "A053:pat on back",
+        "A055:hug",
+        "A056:give object"
     ],
     "aggression": [
         "A050:punch",
@@ -21,11 +22,11 @@
         "A106:hit with object"
     ],
     "unstable_gait": [
-        "A043:falling down",
-        "A044:stumbling"
+        "A042:stagger",
+        "A044:headache/fatigue"
     ],
     "wandering": [
-        "A008:walking",
+        "A111:walk",
         "A058:walking towards",
         "A059:walking apart"
     ],
