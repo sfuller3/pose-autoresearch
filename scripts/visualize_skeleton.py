@@ -12,6 +12,7 @@ import sys
 from pathlib import Path
 
 import matplotlib.pyplot as plt
+from matplotlib.animation import FuncAnimation
 import numpy as np
 
 # Add project root to path so we can import pose_autoresearch
@@ -100,3 +101,96 @@ def draw_skeleton(
         bones.append(line)
 
     return {"joints": joints, "bones": bones}
+
+
+BG_COLOR = "#1a1a2e"
+
+
+def render_animation(
+    frames: list[list[list[float]]],
+    label: str,
+    output_path: str,
+    fps: int = 30,
+    figsize: tuple[float, float] = (8, 6),
+    dpi: int = 100,
+    show_overlay: bool = True,
+) -> None:
+    """Render a skeleton sequence to GIF or MP4.
+
+    Args:
+        frames: List of frames, each a list of 17 [x, y, conf] keypoints.
+        label: Action class label for overlay text.
+        output_path: Output file path (.gif or .mp4).
+        fps: Playback framerate.
+        figsize: Figure size in inches (width, height).
+        dpi: Resolution in dots per inch.
+        show_overlay: Whether to draw text overlay.
+    """
+    fig, ax = plt.subplots(figsize=figsize, dpi=dpi)
+    fig.patch.set_facecolor(BG_COLOR)
+    ax.set_facecolor(BG_COLOR)
+    ax.set_aspect("equal")
+    ax.axis("off")
+
+    # Compute global bounds across all frames for stable view
+    all_kps = np.array(frames)  # (num_frames, 17, 3)
+    all_x = all_kps[:, :, 0]
+    all_y = all_kps[:, :, 1]
+    pad = 0.1
+    x_min, x_max = all_x.min() - pad, all_x.max() + pad
+    y_min, y_max = all_y.min() - pad, all_y.max() + pad
+    ax.set_xlim(x_min, x_max)
+    ax.set_ylim(y_max, y_min)  # Invert Y so head is at top
+
+    num_frames = len(frames)
+
+    def init():
+        return []
+
+    def update(frame_idx):
+        ax.clear()
+        ax.set_facecolor(BG_COLOR)
+        ax.axis("off")
+        ax.set_xlim(x_min, x_max)
+        ax.set_ylim(y_max, y_min)
+
+        draw_skeleton(ax, frames[frame_idx])
+
+        if show_overlay:
+            kps = np.array(frames[frame_idx])
+            mean_conf = kps[:, 2].mean()
+
+            bbox_props = dict(boxstyle="round,pad=0.3", facecolor="black", alpha=0.6)
+            ax.text(
+                0.02, 0.98, label, transform=ax.transAxes,
+                fontsize=14, fontweight="bold", color="white",
+                verticalalignment="top", bbox=bbox_props,
+            )
+            ax.text(
+                0.98, 0.98, f"{frame_idx + 1} / {num_frames}",
+                transform=ax.transAxes,
+                fontsize=11, color="white",
+                verticalalignment="top", horizontalalignment="right",
+                bbox=bbox_props,
+            )
+            ax.text(
+                0.02, 0.02, f"conf: {mean_conf:.2f}",
+                transform=ax.transAxes,
+                fontsize=11, color="white",
+                verticalalignment="bottom", bbox=bbox_props,
+            )
+
+        return []
+
+    anim = FuncAnimation(fig, update, frames=num_frames, init_func=init, blit=False)
+
+    output_path = Path(output_path)
+    if output_path.suffix == ".gif":
+        anim.save(str(output_path), writer="pillow", fps=fps)
+    elif output_path.suffix == ".mp4":
+        anim.save(str(output_path), writer="ffmpeg", fps=fps)
+    else:
+        raise ValueError(f"Unsupported format: {output_path.suffix}. Use .gif or .mp4")
+
+    plt.close(fig)
+    print(f"Saved: {output_path}")

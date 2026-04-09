@@ -83,3 +83,36 @@ def test_draw_skeleton_hides_low_confidence():
     sizes = artists["joints"].get_sizes()
     assert all(s == 0 for s in sizes)
     plt.close(fig)
+
+
+def test_render_animation_creates_gif(tmp_path):
+    """render_animation should produce a GIF file."""
+    mod = _load_mod()
+
+    # Create a minimal 5-frame sample
+    frames = [
+        [[0.3 + i * 0.02 + f * 0.01, 0.5 - i * 0.01, 0.9] for i in range(17)]
+        for f in range(5)
+    ]
+
+    out_path = tmp_path / "test.gif"
+    mod.render_animation(frames, label="fall", output_path=str(out_path), fps=10, figsize=(4, 3), dpi=50)
+
+    assert out_path.exists()
+    assert out_path.stat().st_size > 0
+
+
+def test_render_animation_no_overlay(tmp_path):
+    """render_animation with show_overlay=False should still produce output."""
+    mod = _load_mod()
+
+    frames = [
+        [[0.5, 0.5, 0.9]] * 17
+        for _ in range(3)
+    ]
+
+    out_path = tmp_path / "no_overlay.gif"
+    mod.render_animation(frames, label="test", output_path=str(out_path), fps=10, figsize=(4, 3), dpi=50, show_overlay=False)
+
+    assert out_path.exists()
+    assert out_path.stat().st_size > 0
