@@ -310,6 +310,7 @@ _LE2I_WORKER_SCRIPT = '''
 import sys, json, numpy as np
 from pathlib import Path
 from ultralytics import YOLO
+import av
 
 video_path = Path(sys.argv[1])
 output_dir = Path(sys.argv[2])
@@ -320,11 +321,16 @@ fps = int(sys.argv[6])
 model_name = sys.argv[7]
 
 model = YOLO(model_name)
-results = model(str(video_path), stream=True, verbose=False)
+
+# Use PyAV instead of cv2 to avoid segfaults on corrupted AVI audio streams
+container = av.open(str(video_path))
+stream = container.streams.video[0]
 
 all_frames = []
 frame_idx = 0
-for result in results:
+for frame in container.decode(video=0):
+    img = frame.to_ndarray(format='bgr24')
+    result = model(img, verbose=False)[0]
     if result.keypoints is not None and len(result.keypoints) > 0:
         try:
             kp_xy = result.keypoints.xy[0].cpu().numpy()
@@ -336,6 +342,7 @@ for result in results:
     else:
         all_frames.append({"keypoints": [[0.0, 0.0, 0.0]] * 17, "timestamp": frame_idx / fps})
     frame_idx += 1
+container.close()
 
 # Segment into sequences
 sequences = []
@@ -373,74 +380,89 @@ def convert_le2i(
     model_name: str = "yolo11s-pose.pt",
     seq_len: int = 150,
     fps: int = 30,
+    conf: float = 0.05,
 ) -> int:
     """Convert Le2i dataset videos to pose JSON.
 
-    Each video is processed in a separate subprocess to survive corrupted
-    files that cause C-level crashes (munmap_chunk, realloc errors).
+    Uses PyAV for video decoding (avoids cv2 segfaults on corrupted AVI audio)
+    and loads YOLO once for all videos.
 
     Le2i structure (from Kaggle):
         data/raw/le2i/Coffee_room_01/Coffee_room_01/Videos/*.avi
         data/raw/le2i/Home_01/Home_01/Videos/*.avi
         data/raw/le2i/Lecture_room/Lecture room/*.avi
     """
+    import av
+    from ultralytics import YOLO
+
     count = 0
     errors = 0
 
     videos = list(data_dir.rglob("*.avi")) + list(data_dir.rglob("*.mp4"))
     print(f"  Found {len(videos)} videos in Le2i")
-    print(f"  Processing each video in isolated subprocess (crash-safe)...")
 
-    # Write worker script to temp file
-    import tempfile
-    worker_file = Path(tempfile.mktemp(suffix=".py"))
-    worker_file.write_text(_LE2I_WORKER_SCRIPT)
+    # Load YOLO once for all videos
+    model = YOLO(model_name)
+    print(f"  YOLO model loaded: {model_name}, conf threshold: {conf}")
 
-    try:
-        for i, video_path in enumerate(sorted(videos)):
-            label = _infer_le2i_label(video_path, data_dir)
-            scene = _infer_le2i_scene(video_path, data_dir)
+    for i, video_path in enumerate(sorted(videos)):
+        label = _infer_le2i_label(video_path, data_dir)
+        scene = _infer_le2i_scene(video_path, data_dir)
 
-            try:
-                result = subprocess.run(
-                    [
-                        sys.executable, str(worker_file),
-                        str(video_path), str(output_dir),
-                        label, scene, str(seq_len), str(fps), model_name,
-                    ],
-                    capture_output=True, text=True, timeout=120,
-                )
-
-                if result.returncode == 0:
-                    # Parse the last line of stdout for the count
-                    lines = result.stdout.strip().split("\n")
-                    for line in reversed(lines):
-                        try:
-                            info = json.loads(line)
-                            n = info.get("count", 0)
-                            count += n
-                            print(f"    [{i+1}/{len(videos)}] {video_path.name}: "
-                                  f"{n} seq, {info.get('frames', '?')} frames -> {label}")
-                            break
-                        except json.JSONDecodeError:
-                            continue
+        try:
+            container = av.open(str(video_path))
+            all_frames = []
+            frame_idx = 0
+            for frame in container.decode(video=0):
+                img = frame.to_ndarray(format='bgr24')
+                result = model(img, verbose=False, conf=conf)[0]
+                if result.keypoints is not None and len(result.keypoints) > 0:
+                    try:
+                        kp_xy = result.keypoints.xy[0].cpu().numpy()
+                        kp_conf = result.keypoints.conf[0].cpu().numpy()
+                        keypoints = np.concatenate([kp_xy, kp_conf[:, None]], axis=1).tolist()
+                        all_frames.append({"keypoints": keypoints, "timestamp": frame_idx / fps})
+                    except (IndexError, AttributeError):
+                        all_frames.append({"keypoints": [[0.0, 0.0, 0.0]] * 17, "timestamp": frame_idx / fps})
                 else:
-                    errors += 1
-                    stderr_short = result.stderr.strip()[-200:] if result.stderr else "no stderr"
-                    print(f"    [{i+1}/{len(videos)}] {video_path.name}: CRASHED (rc={result.returncode}) {stderr_short}")
+                    all_frames.append({"keypoints": [[0.0, 0.0, 0.0]] * 17, "timestamp": frame_idx / fps})
+                frame_idx += 1
+            container.close()
 
-            except subprocess.TimeoutExpired:
-                errors += 1
-                print(f"    [{i+1}/{len(videos)}] {video_path.name}: TIMEOUT (>120s)")
-            except Exception as e:
-                errors += 1
-                print(f"    [{i+1}/{len(videos)}] {video_path.name}: ERROR: {e}")
+            # Segment into sequences
+            sequences = []
+            stride = max(1, int(seq_len * 0.5))
+            for start in range(0, len(all_frames) - seq_len + 1, stride):
+                sequences.append(all_frames[start:start + seq_len])
+            if not sequences and all_frames:
+                while len(all_frames) < seq_len:
+                    all_frames.append({"keypoints": [[0.0, 0.0, 0.0]] * 17, "timestamp": len(all_frames) / fps})
+                sequences.append(all_frames[:seq_len])
 
-    finally:
-        worker_file.unlink(missing_ok=True)
+            # Save
+            safe_stem = video_path.stem.replace(" ", "_").replace("(", "").replace(")", "")
+            safe_scene = scene.replace(" ", "_")
+            for seq_idx, frames in enumerate(sequences):
+                sample = {
+                    "frames": frames,
+                    "label": label,
+                    "duration": len(frames) / fps,
+                    "source": f"le2i/{scene}/{video_path.stem}",
+                }
+                filename = f"le2i_{label}_{safe_scene}_{safe_stem}_{seq_idx:04d}.json"
+                with open(output_dir / filename, "w") as f:
+                    json.dump(sample, f)
+                count += 1
+
+            print(f"    [{i+1}/{len(videos)}] {video_path.name}: "
+                  f"{len(sequences)} seq, {frame_idx} frames -> {label}", flush=True)
+
+        except Exception as e:
+            errors += 1
+            print(f"    [{i+1}/{len(videos)}] {video_path.name}: ERROR: {e}", flush=True)
 
     if errors:
-        print(f"  ⚠ {errors} videos failed (corrupted or timed out)")
+        print(f"  ⚠ {errors} videos failed")
 
     return count
 
@@ -465,10 +487,22 @@ def main():
         help="YOLO pose model for Le2i video extraction (default: yolo11s-pose.pt)",
     )
     parser.add_argument(
+        "--le2i-dir",
+        type=Path,
+        default=None,
+        help="Le2i data directory (default: data/raw/le2i). Use data/test_le2i for testing.",
+    )
+    parser.add_argument(
         "--output",
         type=Path,
         default=Path("data/processed"),
         help="Output directory for pose JSON files",
+    )
+    parser.add_argument(
+        "--conf",
+        type=float,
+        default=0.25,
+        help="YOLO confidence threshold (default: 0.25)",
     )
     parser.add_argument(
         "--seq-len",
@@ -500,12 +534,13 @@ def main():
             print(f"\nFallVision not found at {fv_dir}")
 
     if args.source in ("le2i", "all"):
-        le2i_dir = Path("data/raw/le2i")
+        le2i_dir = args.le2i_dir or Path("data/raw/le2i")
         if le2i_dir.exists():
             print(f"\nConverting Le2i from {le2i_dir}...")
-            print(f"  YOLO model: {args.model} (loaded per-subprocess)")
+            print(f"  YOLO model: {args.model}, conf={args.conf}")
 
-            n = convert_le2i(le2i_dir, args.output, args.model, args.seq_len, args.fps)
+            n = convert_le2i(le2i_dir, args.output, args.model, args.seq_len, args.fps,
+                             conf=args.conf)
             total += n
             print(f"Le2i: {n} sequences\n")
         else:

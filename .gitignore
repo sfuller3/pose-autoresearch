@@ -16,8 +16,12 @@ env/
 # Data
 data/raw/*
 data/processed/*
+data/test_le2i/
 !data/raw/.gitkeep
 !data/processed/.gitkeep
+
+# YOLO models
+*.pt
 
 # Checkpoints
 checkpoints/*
