@@ -310,7 +310,7 @@ _LE2I_WORKER_SCRIPT = '''
 import sys, json, numpy as np
 from pathlib import Path
 from ultralytics import YOLO
-import av
+import cv2
 
 video_path = Path(sys.argv[1])
 output_dir = Path(sys.argv[2])
@@ -322,14 +322,15 @@ model_name = sys.argv[7]
 
 model = YOLO(model_name)
 
-# Use PyAV instead of cv2 to avoid segfaults on corrupted AVI audio streams
-container = av.open(str(video_path))
-stream = container.streams.video[0]
+# Use OpenCV for decoding — PyAV corrupts rawvideo AVI frames
+cap = cv2.VideoCapture(str(video_path))
 
 all_frames = []
 frame_idx = 0
-for frame in container.decode(video=0):
-    img = frame.to_ndarray(format='bgr24')
+while True:
+    ret, img = cap.read()
+    if not ret:
+        break
     result = model(img, verbose=False)[0]
     if result.keypoints is not None and len(result.keypoints) > 0:
         try:
@@ -342,7 +343,7 @@ for frame in container.decode(video=0):
     else:
         all_frames.append({"keypoints": [[0.0, 0.0, 0.0]] * 17, "timestamp": frame_idx / fps})
     frame_idx += 1
-container.close()
+cap.release()
 
 # Segment into sequences
 sequences = []
@@ -384,15 +385,16 @@ def convert_le2i(
 ) -> int:
     """Convert Le2i dataset videos to pose JSON.
 
-    Uses PyAV for video decoding (avoids cv2 segfaults on corrupted AVI audio)
-    and loads YOLO once for all videos.
+    Uses OpenCV for video decoding. PyAV was tried previously but corrupts
+    rawvideo AVI frames (garbled pixels, shifted colors), producing near-zero
+    YOLO detections. OpenCV handles these files correctly.
 
     Le2i structure (from Kaggle):
         data/raw/le2i/Coffee_room_01/Coffee_room_01/Videos/*.avi
         data/raw/le2i/Home_01/Home_01/Videos/*.avi
         data/raw/le2i/Lecture_room/Lecture room/*.avi
     """
-    import av
+    import cv2
     from ultralytics import YOLO
 
     count = 0
@@ -410,11 +412,16 @@ def convert_le2i(
         scene = _infer_le2i_scene(video_path, data_dir)
 
         try:
-            container = av.open(str(video_path))
+            cap = cv2.VideoCapture(str(video_path))
+            if not cap.isOpened():
+                raise RuntimeError(f"Cannot open {video_path}")
+
             all_frames = []
             frame_idx = 0
-            for frame in container.decode(video=0):
-                img = frame.to_ndarray(format='bgr24')
+            while True:
+                ret, img = cap.read()
+                if not ret:
+                    break
                 result = model(img, verbose=False, conf=conf)[0]
                 if result.keypoints is not None and len(result.keypoints) > 0:
                     try:
@@ -427,7 +434,7 @@ def convert_le2i(
                 else:
                     all_frames.append({"keypoints": [[0.0, 0.0, 0.0]] * 17, "timestamp": frame_idx / fps})
                 frame_idx += 1
-            container.close()
+            cap.release()
 
             # Segment into sequences
             sequences = []
