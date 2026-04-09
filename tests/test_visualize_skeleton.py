@@ -1,6 +1,7 @@
 """Tests for skeleton visualization script."""
 
 import json
+import subprocess
 from pathlib import Path
 
 import matplotlib
@@ -116,9 +117,6 @@ def test_render_animation_no_overlay(tmp_path):
 
     assert out_path.exists()
     assert out_path.stat().st_size > 0
-
-
-import subprocess
 
 
 def test_cli_single_file(tmp_path):

@@ -206,6 +206,7 @@ def main():
     parser.add_argument("--figsize", type=float, nargs=2, default=[8, 6], metavar=("W", "H"), help="Figure size in inches (default: 8 6)")
     parser.add_argument("--dpi", type=int, default=100, help="Resolution (default: 100)")
     parser.add_argument("--no-overlay", action="store_true", help="Hide text overlay")
+    parser.add_argument("--format", choices=["gif", "mp4"], default="gif", help="Output format for batch mode (default: gif)")
     args = parser.parse_args()
 
     input_path = Path(args.input)
@@ -219,7 +220,7 @@ def main():
         if not json_files:
             print(f"No JSON files found in {input_path}")
             return
-        ext = ".gif"  # Default to GIF for batch
+        ext = f".{args.format}"
         for i, jf in enumerate(json_files, 1):
             print(f"[{i}/{len(json_files)}] {jf.name}")
             frames, label = load_sample(jf)
