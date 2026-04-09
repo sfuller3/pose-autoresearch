@@ -7,6 +7,7 @@ Usage:
 
 from __future__ import annotations
 
+import argparse
 import json
 import sys
 from pathlib import Path
@@ -194,3 +195,48 @@ def render_animation(
 
     plt.close(fig)
     print(f"Saved: {output_path}")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Render skeleton sequences to GIF/MP4.")
+    parser.add_argument("input", help="Path to a JSON sample file or directory (with --batch)")
+    parser.add_argument("-o", "--output", required=True, help="Output file path (.gif/.mp4) or directory (with --batch)")
+    parser.add_argument("--batch", action="store_true", help="Process all JSON files in input directory")
+    parser.add_argument("--fps", type=int, default=30, help="Playback framerate (default: 30)")
+    parser.add_argument("--figsize", type=float, nargs=2, default=[8, 6], metavar=("W", "H"), help="Figure size in inches (default: 8 6)")
+    parser.add_argument("--dpi", type=int, default=100, help="Resolution (default: 100)")
+    parser.add_argument("--no-overlay", action="store_true", help="Hide text overlay")
+    args = parser.parse_args()
+
+    input_path = Path(args.input)
+    output_path = Path(args.output)
+
+    if args.batch:
+        if not input_path.is_dir():
+            parser.error(f"--batch requires a directory, got: {input_path}")
+        output_path.mkdir(parents=True, exist_ok=True)
+        json_files = sorted(input_path.glob("*.json"))
+        if not json_files:
+            print(f"No JSON files found in {input_path}")
+            return
+        ext = ".gif"  # Default to GIF for batch
+        for i, jf in enumerate(json_files, 1):
+            print(f"[{i}/{len(json_files)}] {jf.name}")
+            frames, label = load_sample(jf)
+            out_file = output_path / f"{jf.stem}{ext}"
+            render_animation(
+                frames, label, str(out_file),
+                fps=args.fps, figsize=tuple(args.figsize), dpi=args.dpi,
+                show_overlay=not args.no_overlay,
+            )
+    else:
+        frames, label = load_sample(input_path)
+        render_animation(
+            frames, label, str(output_path),
+            fps=args.fps, figsize=tuple(args.figsize), dpi=args.dpi,
+            show_overlay=not args.no_overlay,
+        )
+
+
+if __name__ == "__main__":
+    main()

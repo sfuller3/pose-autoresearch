@@ -116,3 +116,54 @@ def test_render_animation_no_overlay(tmp_path):
 
     assert out_path.exists()
     assert out_path.stat().st_size > 0
+
+
+import subprocess
+
+
+def test_cli_single_file(tmp_path):
+    """CLI should render a single JSON file to GIF."""
+    # Create a sample JSON
+    sample = {
+        "frames": [
+            {"keypoints": [[0.5 + i * 0.01, 0.5, 0.9] for i in range(17)], "timestamp": t * 0.033}
+            for t in range(5)
+        ],
+        "label": "eating",
+        "duration": 0.165,
+    }
+    in_path = tmp_path / "sample.json"
+    in_path.write_text(json.dumps(sample))
+
+    out_path = tmp_path / "out.gif"
+    result = subprocess.run(
+        [".venv/bin/python", "scripts/visualize_skeleton.py", str(in_path), "-o", str(out_path),
+         "--fps", "10", "--figsize", "4", "3", "--dpi", "50"],
+        capture_output=True, text=True, cwd=str(Path(__file__).resolve().parents[1]),
+    )
+    assert result.returncode == 0, f"stderr: {result.stderr}"
+    assert out_path.exists()
+
+
+def test_cli_batch_mode(tmp_path):
+    """CLI --batch should process all JSON files in a directory."""
+    in_dir = tmp_path / "input"
+    in_dir.mkdir()
+    out_dir = tmp_path / "output"
+
+    for name in ["a.json", "b.json"]:
+        sample = {
+            "frames": [{"keypoints": [[0.5, 0.5, 0.9]] * 17, "timestamp": 0.0}] * 3,
+            "label": "fall",
+            "duration": 0.1,
+        }
+        (in_dir / name).write_text(json.dumps(sample))
+
+    result = subprocess.run(
+        [".venv/bin/python", "scripts/visualize_skeleton.py", str(in_dir), "-o", str(out_dir),
+         "--batch", "--fps", "10", "--figsize", "4", "3", "--dpi", "50"],
+        capture_output=True, text=True, cwd=str(Path(__file__).resolve().parents[1]),
+    )
+    assert result.returncode == 0, f"stderr: {result.stderr}"
+    assert (out_dir / "a.gif").exists()
+    assert (out_dir / "b.gif").exists()
