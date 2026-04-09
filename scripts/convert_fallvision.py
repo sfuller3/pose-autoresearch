@@ -381,20 +381,20 @@ def convert_le2i(
     model_name: str = "yolo11s-pose.pt",
     seq_len: int = 150,
     fps: int = 30,
-    conf: float = 0.05,
+    conf: float = 0.25,
 ) -> int:
     """Convert Le2i dataset videos to pose JSON.
 
-    Uses OpenCV for video decoding. PyAV was tried previously but corrupts
-    rawvideo AVI frames (garbled pixels, shifted colors), producing near-zero
-    YOLO detections. OpenCV handles these files correctly.
+    Uses decord for video decoding. decord handles corrupted AVI audio headers
+    gracefully (unlike cv2 which segfaults on Linux, and PyAV which corrupts
+    rawvideo pixel data).
 
     Le2i structure (from Kaggle):
         data/raw/le2i/Coffee_room_01/Coffee_room_01/Videos/*.avi
         data/raw/le2i/Home_01/Home_01/Videos/*.avi
         data/raw/le2i/Lecture_room/Lecture room/*.avi
     """
-    import cv2
+    from decord import VideoReader, cpu
     from ultralytics import YOLO
 
     count = 0
@@ -412,16 +412,10 @@ def convert_le2i(
         scene = _infer_le2i_scene(video_path, data_dir)
 
         try:
-            cap = cv2.VideoCapture(str(video_path))
-            if not cap.isOpened():
-                raise RuntimeError(f"Cannot open {video_path}")
-
+            vr = VideoReader(str(video_path), ctx=cpu(0))
             all_frames = []
-            frame_idx = 0
-            while True:
-                ret, img = cap.read()
-                if not ret:
-                    break
+            for frame_idx in range(len(vr)):
+                img = vr[frame_idx].asnumpy()
                 result = model(img, verbose=False, conf=conf)[0]
                 if result.keypoints is not None and len(result.keypoints) > 0:
                     try:
@@ -433,36 +427,24 @@ def convert_le2i(
                         all_frames.append({"keypoints": [[0.0, 0.0, 0.0]] * 17, "timestamp": frame_idx / fps})
                 else:
                     all_frames.append({"keypoints": [[0.0, 0.0, 0.0]] * 17, "timestamp": frame_idx / fps})
-                frame_idx += 1
-            cap.release()
+            del vr
 
-            # Segment into sequences
-            sequences = []
-            stride = max(1, int(seq_len * 0.5))
-            for start in range(0, len(all_frames) - seq_len + 1, stride):
-                sequences.append(all_frames[start:start + seq_len])
-            if not sequences and all_frames:
-                while len(all_frames) < seq_len:
-                    all_frames.append({"keypoints": [[0.0, 0.0, 0.0]] * 17, "timestamp": len(all_frames) / fps})
-                sequences.append(all_frames[:seq_len])
-
-            # Save
+            # Save full video as one JSON (no windowing — keep all frames)
             safe_stem = video_path.stem.replace(" ", "_").replace("(", "").replace(")", "")
             safe_scene = scene.replace(" ", "_")
-            for seq_idx, frames in enumerate(sequences):
-                sample = {
-                    "frames": frames,
-                    "label": label,
-                    "duration": len(frames) / fps,
-                    "source": f"le2i/{scene}/{video_path.stem}",
-                }
-                filename = f"le2i_{label}_{safe_scene}_{safe_stem}_{seq_idx:04d}.json"
-                with open(output_dir / filename, "w") as f:
-                    json.dump(sample, f)
-                count += 1
+            sample = {
+                "frames": all_frames,
+                "label": label,
+                "duration": len(all_frames) / fps,
+                "source": f"le2i/{scene}/{video_path.stem}",
+            }
+            filename = f"le2i_{label}_{safe_scene}_{safe_stem}.json"
+            with open(output_dir / filename, "w") as f:
+                json.dump(sample, f)
+            count += 1
 
             print(f"    [{i+1}/{len(videos)}] {video_path.name}: "
-                  f"{len(sequences)} seq, {frame_idx} frames -> {label}", flush=True)
+                  f"{len(all_frames)} frames -> {label}", flush=True)
 
         except Exception as e:
             errors += 1
