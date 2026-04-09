@@ -204,22 +204,19 @@ def convert_fallvision(
                 if not all_frames:
                     continue
 
-                sequences = segment_frames(all_frames, seq_len, overlap=0.5, fps=fps)
+                # Save full video as one JSON (no windowing)
+                sample = {
+                    "frames": all_frames,
+                    "label": label,
+                    "duration": len(all_frames) / fps,
+                    "source": f"fallvision/{label}/{scene}/{csv_file.stem}",
+                }
 
-                for seq_idx, frames in enumerate(sequences):
-                    sample = {
-                        "frames": frames,
-                        "label": label,
-                        "duration": len(frames) / fps,
-                        "source": f"fallvision/{label}/{scene}/{csv_file.stem}",
-                    }
-
-                    filename = f"fv_{label}_{scene}_{csv_file.stem}_{seq_idx:04d}.json"
-                    # Sanitize filename
-                    filename = filename.replace(" ", "_")
-                    with open(output_dir / filename, "w") as f:
-                        json.dump(sample, f)
-                    count += 1
+                filename = f"fv_{label}_{scene}_{csv_file.stem}.json"
+                filename = filename.replace(" ", "_")
+                with open(output_dir / filename, "w") as f:
+                    json.dump(sample, f)
+                count += 1
 
             rar_seqs = sum(1 for _ in output_dir.glob(f"fv_{label}_{scene}_*"))
             print(f"    -> {count} sequences so far")

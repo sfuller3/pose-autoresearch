@@ -102,7 +102,7 @@ def convert(
 
             # Build frames list
             frames = []
-            n_frames = min(total_frames, seq_len)
+            n_frames = total_frames  # Keep full sequence length
             for t in range(n_frames):
                 kp_frame = []
                 for j in range(17):
