@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # Full setup on Thunder Compute: video → poses → training → autoresearch.
 #
-# Everything runs on one A6000 GPU instance ($0.27/hr prototyping tier).
-# YOLO extraction is fast on GPU (~5s/video), training epochs are ~2-5s.
-# Total cost for full pipeline (extract + 100 experiments): ~$2-3.
+# Everything runs on one A100 GPU instance (~$1.10/hr).
+# YOLO extraction is fast on GPU (~5s/video), training epochs are ~1-3s.
+# Total cost for full pipeline (extract + 100 experiments): ~$2-5.
 #
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # FROM YOUR MAC:
@@ -11,9 +11,9 @@
 #   1. Install Thunder CLI:
 #      curl -fsSL https://raw.githubusercontent.com/Thunder-Compute/thunder-cli/main/scripts/install.sh | bash
 #
-#   2. Login & create A6000 instance ($0.27/hr):
+#   2. Login & create A100 instance (~$1.10/hr):
 #      tnr login
-#      tnr create --gpu a6000
+#      tnr create --gpu a100
 #
 #   3. Connect and run (datasets download automatically):
 #      tnr connect <instance-id>

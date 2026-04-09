@@ -24,6 +24,7 @@ from prepare import (
     NUM_KEYPOINTS,
     NUM_BONES,
 )
+from collections import Counter
 
 # ============================================================================
 # HYPERPARAMETERS (agent can modify)
@@ -205,11 +206,33 @@ def main():
     print(f"Time Budget: {MAX_TIME_BUDGET_SECONDS}s")
     print("=" * 70)
 
-    train_loader, val_loader, test_loader = get_dataloaders(
-        batch_size=BATCH_SIZE,
-        num_workers=4,
-        augment_train=True,
-    )
+    splits_dir = Path("data/splits")
+    if splits_dir.exists() and (splits_dir / "train").exists():
+        print("Loading from pre-split directories (data/splits/)")
+        train_ds = PoseDataset(splits_dir / "train", augment=True)
+        val_ds = PoseDataset(splits_dir / "val", augment=False)
+        test_ds = PoseDataset(splits_dir / "test", augment=False)
+
+        pin = DEVICE.type == "cuda"
+        train_loader = DataLoader(
+            train_ds, batch_size=BATCH_SIZE, shuffle=True,
+            num_workers=4, pin_memory=pin,
+        )
+        val_loader = DataLoader(
+            val_ds, batch_size=BATCH_SIZE, shuffle=False,
+            num_workers=4, pin_memory=pin,
+        )
+        test_loader = DataLoader(
+            test_ds, batch_size=BATCH_SIZE, shuffle=False,
+            num_workers=4, pin_memory=pin,
+        )
+    else:
+        print("No data/splits/ found, using random split via get_dataloaders()")
+        train_loader, val_loader, test_loader = get_dataloaders(
+            batch_size=BATCH_SIZE,
+            num_workers=4,
+            augment_train=True,
+        )
 
     print(f"Train: {len(train_loader.dataset)} | Val: {len(val_loader.dataset)} | Test: {len(test_loader.dataset)}")
     print()
@@ -230,9 +253,21 @@ def main():
         optimizer, T_max=50, eta_min=1e-6,
     )
 
-    # Class weights: boost fall (class 0)
+    # Dynamic class weights from training set distribution
+    label_counts = Counter()
+    for _, label in train_loader.dataset:
+        label_counts[label.item() if isinstance(label, torch.Tensor) else label] += 1
+
+    total_samples = sum(label_counts.values())
     class_weights = torch.ones(NUM_CLASSES, device=DEVICE)
-    class_weights[0] = 1.5  # fall priority
+    if label_counts:
+        for cls_idx in range(NUM_CLASSES):
+            count = label_counts.get(cls_idx, 1)
+            class_weights[cls_idx] = total_samples / (NUM_CLASSES * count)
+        # Additional fall-priority boost
+        class_weights[0] *= 1.5
+        print(f"Class weights: {', '.join(f'{EVENT_CLASSES[i]}={class_weights[i]:.2f}' for i in range(NUM_CLASSES))}")
+
     criterion = nn.CrossEntropyLoss(weight=class_weights, label_smoothing=0.1)
 
     start_time = time.time()

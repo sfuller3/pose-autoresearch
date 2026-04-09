@@ -115,15 +115,8 @@ def convert(
                     "timestamp": t / fps,
                 })
 
-            # Pad short sequences to seq_len
-            while len(frames) < seq_len:
-                frames.append({
-                    "keypoints": [[0.0, 0.0, 0.0]] * 17,
-                    "timestamp": len(frames) / fps,
-                })
-
             output = {
-                "frames": frames[:seq_len],
+                "frames": frames,
                 "label": vistarra_class,
                 "duration": n_frames / fps,
                 "source": f"ntu120:{frame_dir}",
