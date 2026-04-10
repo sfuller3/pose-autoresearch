@@ -21,11 +21,14 @@ data/test_le2i/
 !data/processed/.gitkeep
 
 # YOLO models
-*.pt
+yolo*.pt
 
 # Checkpoints
 checkpoints/*
 !checkpoints/.gitkeep
+!checkpoints/best_hybrid.pt
+!checkpoints/best_transformer.pt
+!checkpoints/best_model.pt
 
 # Logs
 results.tsv
