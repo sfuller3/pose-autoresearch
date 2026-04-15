@@ -432,3 +432,37 @@ class TestConfidenceGating:
         assert torch.allclose(torch.sigmoid(torch.tensor(0.0 * 5 - 2)), torch.tensor(0.1192), atol=1e-3)
         assert torch.allclose(torch.sigmoid(torch.tensor(0.4 * 5 - 2)), torch.tensor(0.5000), atol=1e-3)
         assert torch.allclose(torch.sigmoid(torch.tensor(1.0 * 5 - 2)), torch.tensor(0.9526), atol=1e-3)
+
+
+class TestMixup:
+    """Tests for the temporal MixUp augmentation."""
+
+    def test_mixup_data_shapes(self):
+        """Shapes and lambda bounds are correct after mixup."""
+        from train import mixup_data
+
+        B, T, C = 4, 150, 51
+        x = torch.randn(B, T, C)
+        y = torch.randint(0, 7, (B,))
+
+        mixed_x, y_a, y_b, lam = mixup_data(x, y, alpha=0.2)
+
+        assert mixed_x.shape == x.shape
+        assert y_a.shape == (B,)
+        assert y_b.shape == (B,)
+        assert 0.0 <= lam <= 1.0
+
+    def test_mixup_lambda_extreme(self):
+        """Beta(0.2, 0.2) is U-shaped, so lambda should span both halves."""
+        from train import mixup_data
+
+        x = torch.randn(2, 10, 5)
+        y = torch.zeros(2, dtype=torch.long)
+
+        lams = []
+        for _ in range(200):
+            _, _, _, lam = mixup_data(x, y, alpha=0.2)
+            lams.append(lam)
+
+        assert any(l > 0.5 for l in lams), "Expected at least one lambda > 0.5"
+        assert any(l < 0.5 for l in lams), "Expected at least one lambda < 0.5"

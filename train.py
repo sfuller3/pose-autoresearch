@@ -5,6 +5,7 @@ The agent modifies this file to improve validation accuracy.
 
 from __future__ import annotations
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -314,8 +315,22 @@ class FocalLoss(nn.Module):
         return focal.mean()
 
 
-def train_epoch(model, dataloader, optimizer, criterion, scheduler, device):
-    """Train for one epoch."""
+def mixup_data(x, y, alpha=0.2):
+    """Temporal MixUp: blend two sequences with random lambda."""
+    if alpha > 0:
+        lam = np.random.beta(alpha, alpha)
+    else:
+        lam = 1.0
+    batch_size = x.size(0)
+    index = torch.randperm(batch_size, device=x.device)
+    mixed_x = lam * x + (1 - lam) * x[index]
+    y_a, y_b = y, y[index]
+    return mixed_x, y_a, y_b, lam
+
+
+def train_epoch(model, dataloader, optimizer, criterion, scheduler, device,
+                use_mixup=True):
+    """Train for one epoch with optional temporal mixup."""
     model.train()
     total_loss = 0
     correct = 0
@@ -325,8 +340,18 @@ def train_epoch(model, dataloader, optimizer, criterion, scheduler, device):
         poses = poses.to(device)
         labels = labels.to(device)
 
-        logits = model(poses)
-        loss = criterion(logits, labels)
+        if use_mixup and np.random.random() < 0.5:
+            poses, labels_a, labels_b, lam = mixup_data(poses, labels)
+            logits = model(poses)
+            loss = lam * criterion(logits, labels_a) + (1 - lam) * criterion(logits, labels_b)
+            preds = torch.argmax(logits, dim=1)
+            correct += (lam * (preds == labels_a).float() +
+                       (1 - lam) * (preds == labels_b).float()).sum().item()
+        else:
+            logits = model(poses)
+            loss = criterion(logits, labels)
+            preds = torch.argmax(logits, dim=1)
+            correct += (preds == labels).sum().item()
 
         optimizer.zero_grad()
         loss.backward()
@@ -334,8 +359,6 @@ def train_epoch(model, dataloader, optimizer, criterion, scheduler, device):
         optimizer.step()
 
         total_loss += loss.item()
-        preds = torch.argmax(logits, dim=1)
-        correct += (preds == labels).sum().item()
         total += labels.size(0)
 
     if scheduler is not None:
