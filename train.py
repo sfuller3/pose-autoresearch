@@ -191,18 +191,23 @@ class PoseEventClassifier(nn.Module):
 
         in_dim = FULL_INPUT_DIM  # joint(51) + bone(48) + velocity(51) = 150
 
+        # Channel progression for temporal blocks. The last value is the
+        # feature dim consumed by the pool and classifier head.
+        BLOCK_CHANNELS = (128, 128, 256, 256)
+        final_channels = BLOCK_CHANNELS[-1]
+
         self.input_bn = nn.BatchNorm1d(in_dim)
 
         self.blocks = nn.ModuleList([
-            MultiScaleTemporalBlock(in_dim, 128, kernels=(3, 7, 15), dropout=dropout),
-            MultiScaleTemporalBlock(128, 128, kernels=(3, 7, 15), dropout=dropout),
-            MultiScaleTemporalBlock(128, 256, kernels=(3, 7, 15), stride=2, dropout=dropout),
-            MultiScaleTemporalBlock(256, 256, kernels=(3, 7, 15), dropout=dropout),
+            MultiScaleTemporalBlock(in_dim, BLOCK_CHANNELS[0], kernels=(3, 7, 15), dropout=dropout),
+            MultiScaleTemporalBlock(BLOCK_CHANNELS[0], BLOCK_CHANNELS[1], kernels=(3, 7, 15), dropout=dropout),
+            MultiScaleTemporalBlock(BLOCK_CHANNELS[1], BLOCK_CHANNELS[2], kernels=(3, 7, 15), stride=2, dropout=dropout),
+            MultiScaleTemporalBlock(BLOCK_CHANNELS[2], BLOCK_CHANNELS[3], kernels=(3, 7, 15), dropout=dropout),
         ])
 
-        self.pool = TemporalAttentionPool(256)
+        self.pool = TemporalAttentionPool(final_channels)
 
-        self.fc = nn.Linear(256, num_classes)
+        self.fc = nn.Linear(final_channels, num_classes)
 
     def forward(self, x):
         """
