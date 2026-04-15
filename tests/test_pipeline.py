@@ -393,3 +393,31 @@ class TestTemporalAttentionPool:
         out = pool(x).sum()
         out.backward()
         assert x.grad is not None and x.grad.abs().sum() > 0
+
+
+# ============================================================================
+# Confidence gating tests
+# ============================================================================
+
+
+class TestConfidenceGating:
+    def test_zero_confidence_attenuates_joints(self):
+        """When all joints have conf=0, gated coords should be attenuated
+        (gate ~0.12), producing different model outputs vs. conf=1 (gate ~0.95)."""
+        from train import PoseEventClassifier
+        m = PoseEventClassifier().eval()
+
+        # All coords = 10.0, all conf = 0.0 -> gate ~0.12, gated coords ~1.2
+        x_low = torch.ones(1, 150, 51) * 10.0
+        x_low[:, :, 2::3] = 0.0
+
+        # All coords = 10.0, all conf = 1.0 -> gate ~0.95, gated coords ~9.5
+        x_high = torch.ones(1, 150, 51) * 10.0
+        x_high[:, :, 2::3] = 1.0
+
+        with torch.no_grad():
+            out_low = m(x_low)
+            out_high = m(x_high)
+
+        # Outputs should differ -- gating is active
+        assert not torch.allclose(out_low, out_high, atol=1e-4)

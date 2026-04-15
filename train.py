@@ -221,23 +221,34 @@ class PoseEventClassifier(nn.Module):
         # Compute bone and velocity features in pure PyTorch (stays on GPU)
         kps = x.view(B, T, NUM_JOINTS, 3)  # (B, T, 17, 3)
 
-        # Velocity: frame-to-frame displacement
+        # Velocity: frame-to-frame displacement (uses raw kps; velocity stream
+        # carries its own conf channel, so we don't gate it here)
         vel = torch.zeros_like(kps)
         vel[:, 1:, :, :2] = kps[:, 1:, :, :2] - kps[:, :-1, :, :2]
         vel[:, :, :, 2] = kps[:, :, :, 2]  # keep confidence
         vel_flat = vel.reshape(B, T, -1)  # (B, T, 51)
 
-        # Bones: vectors between connected joints
+        # Confidence gating: attenuate features from low-confidence joints.
+        # This prevents noisy YOLO detections from dominating the representation.
+        # sigmoid(conf*5 - 2): conf<0.2 -> ~0.12, conf=0.4 -> 0.5, conf>0.6 -> ~0.73+
+        conf = kps[:, :, :, 2:3]  # (B, T, 17, 1)
+        conf_gate = torch.sigmoid(conf * 5 - 2)
+        gated_kps = kps.clone()
+        gated_kps[:, :, :, :2] = kps[:, :, :, :2] * conf_gate
+        x_gated = gated_kps.reshape(B, T, -1)  # (B, T, 51) with gated coords
+
+        # Bones: vectors between connected joints (computed from gated coords so
+        # zero-confidence joints contribute zero displacement rather than noise)
         bone_parts = []
         for parent, child in BONE_PAIRS:
-            dx = kps[:, :, child, 0] - kps[:, :, parent, 0]
-            dy = kps[:, :, child, 1] - kps[:, :, parent, 1]
+            dx = gated_kps[:, :, child, 0] - gated_kps[:, :, parent, 0]
+            dy = gated_kps[:, :, child, 1] - gated_kps[:, :, parent, 1]
             conf = (kps[:, :, child, 2] + kps[:, :, parent, 2]) / 2
             bone_parts.append(torch.stack([dx, dy, conf], dim=2))  # (B, T, 3)
         bones_flat = torch.cat(bone_parts, dim=2)  # (B, T, 48)
 
         # Concatenate joint + bone + velocity
-        x = torch.cat([x, bones_flat, vel_flat], dim=2)  # (B, T, 150)
+        x = torch.cat([x_gated, bones_flat, vel_flat], dim=2)  # (B, T, 150)
 
         # Input normalization
         x = x.permute(0, 2, 1)  # (B, 150, T)
