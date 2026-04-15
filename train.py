@@ -79,6 +79,52 @@ class TemporalBlock(nn.Module):
         return x
 
 
+class MultiScaleTemporalBlock(nn.Module):
+    """Multi-scale 1D temporal convolution with residual connection.
+
+    Parallel convolutions at kernel sizes 3, 7, 15 capture fast actions
+    (fall impact ~0.3s), medium motions (eating cycles ~1s), and slow
+    patterns (wandering ~5s) simultaneously.
+    """
+
+    def __init__(self, in_ch, out_ch, kernels=(3, 7, 15), stride=1, dropout=0.3):
+        super().__init__()
+        branch_ch = out_ch // len(kernels)
+        remainder = out_ch - branch_ch * len(kernels)
+
+        self.branches = nn.ModuleList()
+        for i, k in enumerate(kernels):
+            ch = branch_ch + (remainder if i == 0 else 0)
+            pad = (k - 1) // 2
+            self.branches.append(nn.Sequential(
+                nn.Conv1d(in_ch, ch, k, stride=stride, padding=pad),
+                nn.BatchNorm1d(ch),
+                nn.SiLU(inplace=True),
+            ))
+
+        self.conv2 = nn.Conv1d(out_ch, out_ch, 3, padding=1)
+        self.bn2 = nn.BatchNorm1d(out_ch)
+        self.dropout = nn.Dropout(dropout)
+        self.act = nn.SiLU(inplace=True)
+
+        if in_ch != out_ch or stride != 1:
+            self.residual = nn.Sequential(
+                nn.Conv1d(in_ch, out_ch, 1, stride=stride),
+                nn.BatchNorm1d(out_ch),
+            )
+        else:
+            self.residual = nn.Identity()
+
+    def forward(self, x):
+        res = self.residual(x)
+        branches = [branch(x) for branch in self.branches]
+        x = torch.cat(branches, dim=1)  # (B, out_ch, T')
+        x = self.dropout(x)
+        x = self.bn2(self.conv2(x))
+        x = self.act(x + res)
+        return x
+
+
 class PoseEventClassifier(nn.Module):
     """Lightweight 1D temporal CNN for pose event classification.
 
@@ -101,12 +147,12 @@ class PoseEventClassifier(nn.Module):
 
         self.input_bn = nn.BatchNorm1d(in_dim)
 
-        self.blocks = nn.Sequential(
-            TemporalBlock(in_dim, 128, kernel_size=7, dropout=dropout),
-            TemporalBlock(128, 128, kernel_size=7, dropout=dropout),
-            TemporalBlock(128, 256, kernel_size=5, stride=2, dropout=dropout),
-            TemporalBlock(256, 256, kernel_size=5, dropout=dropout),
-        )
+        self.blocks = nn.ModuleList([
+            MultiScaleTemporalBlock(in_dim, 128, kernels=(3, 7, 15), dropout=dropout),
+            MultiScaleTemporalBlock(128, 128, kernels=(3, 7, 15), dropout=dropout),
+            MultiScaleTemporalBlock(128, 256, kernels=(3, 7, 15), stride=2, dropout=dropout),
+            MultiScaleTemporalBlock(256, 256, kernels=(3, 7, 15), dropout=dropout),
+        ])
 
         self.fc = nn.Linear(256, num_classes)
 
@@ -145,7 +191,8 @@ class PoseEventClassifier(nn.Module):
         x = self.input_bn(x)
 
         # Temporal blocks
-        x = self.blocks(x)  # (B, 256, T')
+        for block in self.blocks:
+            x = block(x)  # (B, 256, T')
 
         # Global average pooling over time
         x = x.mean(dim=2)  # (B, 256)
