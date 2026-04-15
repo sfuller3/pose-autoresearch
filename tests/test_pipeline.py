@@ -265,3 +265,109 @@ class TestModel:
         assert set(per_class.keys()) == set(EVENT_CLASSES)
         for cls, acc in per_class.items():
             assert 0.0 <= acc <= 1.0
+
+
+# ============================================================================
+# FocalLoss tests
+# ============================================================================
+
+
+class TestFocalLoss:
+    def test_gamma_zero_reduces_to_weighted_ce(self):
+        """With gamma=0, focal loss must equal weighted cross-entropy
+        (using plain-mean reduction, matching FocalLoss's ``focal.mean()``)."""
+        from train import FocalLoss
+        import torch.nn.functional as F
+
+        torch.manual_seed(0)
+        num_classes = len(EVENT_CLASSES)
+        logits = torch.randn(16, num_classes)
+        targets = torch.randint(0, num_classes, (16,))
+        weight = torch.linspace(0.5, 1.5, num_classes)
+
+        focal = FocalLoss(weight=weight, gamma=0.0, label_smoothing=0.0)
+        focal_loss = focal(logits, targets)
+
+        # FocalLoss applies plain .mean() over the batch of weighted CEs,
+        # which differs from F.cross_entropy's default weighted-mean
+        # (divides by sum-of-weights). Use reduction="none" then .mean().
+        ce_per_sample = F.cross_entropy(
+            logits, targets, weight=weight, reduction="none",
+        )
+        torch.testing.assert_close(
+            focal_loss, ce_per_sample.mean(), rtol=1e-5, atol=1e-6,
+        )
+
+    def test_gamma_zero_with_label_smoothing_matches_ce(self):
+        """With gamma=0 and smoothing, focal must match smoothed weighted CE
+        (plain-mean reduction)."""
+        from train import FocalLoss
+        import torch.nn.functional as F
+
+        torch.manual_seed(1)
+        num_classes = len(EVENT_CLASSES)
+        logits = torch.randn(16, num_classes)
+        targets = torch.randint(0, num_classes, (16,))
+        weight = torch.linspace(0.5, 1.5, num_classes)
+
+        focal = FocalLoss(weight=weight, gamma=0.0, label_smoothing=0.1)
+        focal_loss = focal(logits, targets)
+
+        ce_per_sample = F.cross_entropy(
+            logits, targets, weight=weight, label_smoothing=0.1,
+            reduction="none",
+        )
+        torch.testing.assert_close(
+            focal_loss, ce_per_sample.mean(), rtol=1e-5, atol=1e-6,
+        )
+
+    def test_confident_correct_lower_than_confident_wrong(self):
+        """A confident-correct prediction should incur a smaller loss
+        than a confident-wrong prediction."""
+        from train import FocalLoss
+
+        num_classes = len(EVENT_CLASSES)
+        loss_fn = FocalLoss(gamma=2.0, label_smoothing=0.1)
+
+        # Confidently correct: class 0 with high logit
+        correct_logits = torch.full((1, num_classes), -5.0)
+        correct_logits[0, 0] = 5.0
+        correct_target = torch.tensor([0])
+
+        # Confidently wrong: predicts class 0 but true label is 1
+        wrong_logits = torch.full((1, num_classes), -5.0)
+        wrong_logits[0, 0] = 5.0
+        wrong_target = torch.tensor([1])
+
+        loss_correct = loss_fn(correct_logits, correct_target)
+        loss_wrong = loss_fn(wrong_logits, wrong_target)
+
+        assert loss_correct.item() < loss_wrong.item()
+
+    def test_backward_produces_nonzero_grad(self):
+        """Focal loss must produce non-zero gradients via backward."""
+        from train import FocalLoss
+
+        num_classes = len(EVENT_CLASSES)
+        loss_fn = FocalLoss(gamma=2.0, label_smoothing=0.1)
+        logits = torch.randn(8, num_classes, requires_grad=True)
+        targets = torch.randint(0, num_classes, (8,))
+
+        loss = loss_fn(logits, targets)
+        loss.backward()
+
+        assert torch.isfinite(loss)
+        assert logits.grad is not None
+        assert logits.grad.norm().item() > 0
+
+    def test_weight_registered_as_buffer(self):
+        """When weight is provided, it should be a registered buffer
+        so .to(device) moves it along with the module."""
+        from train import FocalLoss
+
+        num_classes = len(EVENT_CLASSES)
+        weight = torch.ones(num_classes)
+        loss_fn = FocalLoss(weight=weight, gamma=2.0)
+
+        buffer_names = {name for name, _ in loss_fn.named_buffers()}
+        assert "weight" in buffer_names

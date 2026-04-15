@@ -234,22 +234,40 @@ class FocalLoss(nn.Module):
 
     Reduces loss for well-classified examples, focusing training on
     confused classes (eating vs sitting_standing, unstable_gait detection).
+
+    Note: ``pt`` is computed directly from the softmax probability of the
+    true class (via ``log_softmax.gather``), so the focal modulation
+    ``(1 - pt)**gamma`` is decoupled from both the per-class ``weight`` and
+    ``label_smoothing``. The previous ``pt = exp(-ce)`` identity only holds
+    for unweighted, unsmoothed CE on one-hot targets; with class weights it
+    becomes ``p_true**w_y`` and with label smoothing it becomes a mixed
+    quantity, both of which silently distort the focal factor.
     """
 
     def __init__(self, weight=None, gamma=2.0, label_smoothing=0.1):
         super().__init__()
+        if weight is not None:
+            self.register_buffer("weight", weight)
+        else:
+            self.weight = None
         self.gamma = gamma
-        self.weight = weight
         self.label_smoothing = label_smoothing
 
     def forward(self, logits, targets):
+        # True-class probability (independent of weight/smoothing)
+        log_probs = F.log_softmax(logits, dim=-1)
+        log_pt = log_probs.gather(1, targets.unsqueeze(1)).squeeze(1)
+        pt = log_pt.exp()
+
+        # Standard CE with weight + label smoothing
         ce = F.cross_entropy(
             logits, targets,
             weight=self.weight,
             label_smoothing=self.label_smoothing,
             reduction="none",
         )
-        pt = torch.exp(-ce)
+
+        # Focal modulation
         focal = ((1 - pt) ** self.gamma) * ce
         return focal.mean()
 
