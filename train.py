@@ -115,14 +115,38 @@ class MultiScaleTemporalBlock(nn.Module):
         else:
             self.residual = nn.Identity()
 
+        self.se = SqueezeExcitation(out_ch)
+
     def forward(self, x):
         res = self.residual(x)
         branches = [branch(x) for branch in self.branches]
         x = torch.cat(branches, dim=1)  # (B, out_ch, T')
         x = self.dropout(x)
         x = self.bn2(self.conv2(x))
+        x = self.se(x)
         x = self.act(x + res)
         return x
+
+
+class SqueezeExcitation(nn.Module):
+    """Channel attention via squeeze-and-excitation."""
+
+    def __init__(self, channels: int, reduction: int = 4):
+        super().__init__()
+        mid = max(channels // reduction, 8)
+        self.se = nn.Sequential(
+            nn.AdaptiveAvgPool1d(1),
+            nn.Flatten(),
+            nn.Linear(channels, mid),
+            nn.SiLU(inplace=True),
+            nn.Linear(mid, channels),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, x):
+        # x: (B, C, T)
+        w = self.se(x).unsqueeze(2)  # (B, C, 1)
+        return x * w
 
 
 class PoseEventClassifier(nn.Module):
