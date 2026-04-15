@@ -229,6 +229,31 @@ class PoseEventClassifier(nn.Module):
 # ============================================================================
 
 
+class FocalLoss(nn.Module):
+    """Focal loss with per-class weights for hard-example mining.
+
+    Reduces loss for well-classified examples, focusing training on
+    confused classes (eating vs sitting_standing, unstable_gait detection).
+    """
+
+    def __init__(self, weight=None, gamma=2.0, label_smoothing=0.1):
+        super().__init__()
+        self.gamma = gamma
+        self.weight = weight
+        self.label_smoothing = label_smoothing
+
+    def forward(self, logits, targets):
+        ce = F.cross_entropy(
+            logits, targets,
+            weight=self.weight,
+            label_smoothing=self.label_smoothing,
+            reduction="none",
+        )
+        pt = torch.exp(-ce)
+        focal = ((1 - pt) ** self.gamma) * ce
+        return focal.mean()
+
+
 def train_epoch(model, dataloader, optimizer, criterion, scheduler, device):
     """Train for one epoch."""
     model.train()
@@ -337,7 +362,7 @@ def main():
         class_weights[0] *= 1.5
         print(f"Class weights: {', '.join(f'{EVENT_CLASSES[i]}={class_weights[i]:.2f}' for i in range(NUM_CLASSES))}")
 
-    criterion = nn.CrossEntropyLoss(weight=class_weights, label_smoothing=0.1)
+    criterion = FocalLoss(weight=class_weights, gamma=2.0, label_smoothing=0.1)
 
     start_time = time.time()
     epoch = 0
