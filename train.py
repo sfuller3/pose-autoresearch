@@ -243,8 +243,8 @@ class PoseEventClassifier(nn.Module):
         for parent, child in BONE_PAIRS:
             dx = gated_kps[:, :, child, 0] - gated_kps[:, :, parent, 0]
             dy = gated_kps[:, :, child, 1] - gated_kps[:, :, parent, 1]
-            conf = (kps[:, :, child, 2] + kps[:, :, parent, 2]) / 2
-            bone_parts.append(torch.stack([dx, dy, conf], dim=2))  # (B, T, 3)
+            bone_conf = (kps[:, :, child, 2] + kps[:, :, parent, 2]) / 2
+            bone_parts.append(torch.stack([dx, dy, bone_conf], dim=2))  # (B, T, 3)
         bones_flat = torch.cat(bone_parts, dim=2)  # (B, T, 48)
 
         # Concatenate joint + bone + velocity

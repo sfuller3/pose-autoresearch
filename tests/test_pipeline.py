@@ -421,3 +421,14 @@ class TestConfidenceGating:
 
         # Outputs should differ -- gating is active
         assert not torch.allclose(out_low, out_high, atol=1e-4)
+
+    def test_gate_values_are_correct(self):
+        """Verify the sigmoid gate produces the documented values."""
+        import torch
+        # Gate formula: sigmoid(conf * 5 - 2)
+        # conf=0.0 -> sigmoid(-2) ~ 0.1192
+        # conf=0.4 -> sigmoid(0)  = 0.5
+        # conf=1.0 -> sigmoid(3)  ~ 0.9526
+        assert torch.allclose(torch.sigmoid(torch.tensor(0.0 * 5 - 2)), torch.tensor(0.1192), atol=1e-3)
+        assert torch.allclose(torch.sigmoid(torch.tensor(0.4 * 5 - 2)), torch.tensor(0.5000), atol=1e-3)
+        assert torch.allclose(torch.sigmoid(torch.tensor(1.0 * 5 - 2)), torch.tensor(0.9526), atol=1e-3)
