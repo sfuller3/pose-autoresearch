@@ -371,3 +371,25 @@ class TestFocalLoss:
 
         buffer_names = {name for name, _ in loss_fn.named_buffers()}
         assert "weight" in buffer_names
+
+
+# ============================================================================
+# TemporalAttentionPool tests
+# ============================================================================
+
+
+class TestTemporalAttentionPool:
+    def test_temporal_attention_pool_output_shape(self):
+        from train import TemporalAttentionPool
+        pool = TemporalAttentionPool(256)
+        x = torch.randn(2, 256, 75)
+        out = pool(x)
+        assert out.shape == (2, 256)
+
+    def test_temporal_attention_pool_grad_flow(self):
+        from train import TemporalAttentionPool
+        pool = TemporalAttentionPool(256)
+        x = torch.randn(2, 256, 75, requires_grad=True)
+        out = pool(x).sum()
+        out.backward()
+        assert x.grad is not None and x.grad.abs().sum() > 0

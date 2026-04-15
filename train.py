@@ -149,6 +149,30 @@ class SqueezeExcitation(nn.Module):
         return x * w
 
 
+class TemporalAttentionPool(nn.Module):
+    """Learned attention pooling over temporal dimension.
+
+    Instead of average pooling (which weights all frames equally),
+    learns which frames are most discriminative for classification.
+    """
+
+    def __init__(self, channels: int):
+        super().__init__()
+        self.attn = nn.Sequential(
+            nn.Linear(channels, channels // 4),
+            nn.Tanh(),
+            nn.Linear(channels // 4, 1),
+        )
+
+    def forward(self, x):
+        # x: (B, C, T)
+        x_t = x.permute(0, 2, 1)  # (B, T, C)
+        weights = self.attn(x_t).squeeze(-1)  # (B, T)
+        weights = F.softmax(weights, dim=1)
+        pooled = torch.bmm(weights.unsqueeze(1), x_t).squeeze(1)  # (B, C)
+        return pooled
+
+
 class PoseEventClassifier(nn.Module):
     """Lightweight 1D temporal CNN for pose event classification.
 
@@ -175,6 +199,8 @@ class PoseEventClassifier(nn.Module):
             MultiScaleTemporalBlock(128, 256, kernels=(3, 7, 15), stride=2, dropout=dropout),
             MultiScaleTemporalBlock(256, 256, kernels=(3, 7, 15), dropout=dropout),
         ])
+
+        self.pool = TemporalAttentionPool(256)
 
         self.fc = nn.Linear(256, num_classes)
 
@@ -216,8 +242,8 @@ class PoseEventClassifier(nn.Module):
         for block in self.blocks:
             x = block(x)  # (B, 256, T')
 
-        # Global average pooling over time
-        x = x.mean(dim=2)  # (B, 256)
+        # Temporal attention pooling (learned per-frame importance)
+        x = self.pool(x)  # (B, 256)
 
         # Classify
         logits = self.fc(x)
