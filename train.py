@@ -137,8 +137,6 @@ class PoseEventClassifier(nn.Module):
         input_channels: int = INPUT_CHANNELS,
         num_joints: int = NUM_JOINTS,
         num_classes: int = NUM_CLASSES,
-        gcn_channels: list[int] | None = None,
-        temporal_kernel: int = 9,
         dropout: float = DROPOUT,
     ):
         super().__init__()
