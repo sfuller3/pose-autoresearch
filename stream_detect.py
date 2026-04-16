@@ -657,6 +657,66 @@ def draw_overlay(frame: np.ndarray, smoother: EventSmoother, fps: float) -> np.n
 
 
 # ============================================================================
+# CONTEXT-BASED EVENT SUPPRESSION
+# ============================================================================
+
+def apply_context_rules(
+    probs: np.ndarray,
+    person_detected: bool,
+    env_features: np.ndarray,
+    env_detections: list[dict],
+) -> np.ndarray:
+    """Apply environment-aware probability adjustments.
+
+    Rules:
+    1. No person → suppress fall/aggression (existing)
+    2. Person on bed → suppress fall, boost sitting_standing
+    3. Person near table → boost eating prior
+    4. Person near door → suppress wandering (purposeful movement)
+    5. Person with walker/wheelchair → boost unstable_gait prior
+    """
+    probs = probs.copy()
+
+    # Rule 1: No person detected
+    if not person_detected:
+        probs[CLASS_TO_IDX["fall"]] *= 0.1
+        probs[CLASS_TO_IDX["aggression"]] *= 0.1
+
+    # Extract detected object classes
+    detected_objects = {d["class"] for d in env_detections}
+
+    # Rule 2: Bed detected and person overlapping
+    if "bed" in detected_objects:
+        # If env_features shows high bed proximity (index 0 = bed)
+        bed_proximity = env_features[1] if len(env_features) > 1 else 0
+        if bed_proximity > 0.5:
+            probs[CLASS_TO_IDX["fall"]] *= 0.3
+            probs[CLASS_TO_IDX["sitting_standing"]] *= 1.5
+
+    # Rule 3: Table nearby → eating more likely
+    if "table" in detected_objects:
+        table_idx = sorted(EnvironmentDetector.CONTEXT_CLASSES).index("table")
+        table_proximity = env_features[table_idx * 4 + 1]
+        if table_proximity > 0.4:
+            probs[CLASS_TO_IDX["eating"]] *= 1.8
+
+    # Rule 4: Door nearby → suppress wandering
+    if "door" in detected_objects:
+        door_idx = sorted(EnvironmentDetector.CONTEXT_CLASSES).index("door")
+        door_proximity = env_features[door_idx * 4 + 1]
+        if door_proximity > 0.5:
+            probs[CLASS_TO_IDX["wandering"]] *= 0.4
+
+    # Rule 5: Mobility aid → boost unstable_gait prior
+    if "walker" in detected_objects or "wheelchair" in detected_objects:
+        probs[CLASS_TO_IDX["unstable_gait"]] *= 1.5
+
+    # Renormalize
+    probs /= probs.sum()
+    return probs
+
+
+# ============================================================================
 # MAIN PIPELINE
 # ============================================================================
 
@@ -744,6 +804,10 @@ def run_pipeline(args):
                 continue
 
             probs = detector.predict(buffer)
+
+            # 4b. Context-based probability adjustments
+            person_detected = kps is not None
+            probs = apply_context_rules(probs, person_detected, env_features, env_detections)
 
             # 5. Event smoothing
             event = smoother.update(probs)
