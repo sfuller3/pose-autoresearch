@@ -687,8 +687,8 @@ def apply_context_rules(
 
     # Rule 2: Bed detected and person overlapping
     if "bed" in detected_objects:
-        # If env_features shows high bed proximity (index 0 = bed)
-        bed_proximity = env_features[1] if len(env_features) > 1 else 0
+        bed_idx = sorted(EnvironmentDetector.CONTEXT_CLASSES).index("bed")
+        bed_proximity = env_features[bed_idx * 4 + 1]
         if bed_proximity > 0.5:
             probs[CLASS_TO_IDX["fall"]] *= 0.3
             probs[CLASS_TO_IDX["sitting_standing"]] *= 1.5

@@ -486,6 +486,63 @@ class TestMixup:
         assert lam_a2 == lam_b2, f"Expected reproducible lambda, got {lam_a2} vs {lam_b2}"
 
 
+# ============================================================================
+# Pillar 1: Environment-aware detection tests
+# ============================================================================
+
+
+class TestSpatialFeatures:
+    def test_zero_features_when_no_detections(self):
+        """Empty detections produce zero feature vector."""
+        from stream_detect import EnvironmentDetector
+
+        det = EnvironmentDetector.__new__(EnvironmentDetector)
+        det._class_list = sorted(EnvironmentDetector.CONTEXT_CLASSES)
+        det._class_to_idx = {c: i for i, c in enumerate(det._class_list)}
+
+        features = det.compute_spatial_features([], None, (480, 640))
+        assert features.shape == (32,)
+        assert np.allclose(features, 0.0)
+
+    def test_features_with_detection(self):
+        """Detection sets presence flag and computes proximity."""
+        from stream_detect import EnvironmentDetector
+
+        det = EnvironmentDetector.__new__(EnvironmentDetector)
+        det._class_list = sorted(EnvironmentDetector.CONTEXT_CLASSES)
+        det._class_to_idx = {c: i for i, c in enumerate(det._class_list)}
+
+        # Person at center (320, 240), bed bbox at center
+        kps = np.zeros((17, 3), dtype=np.float32)
+        kps[11] = [320, 240, 0.9]  # left hip
+        kps[12] = [320, 240, 0.9]  # right hip
+
+        detections = [{"class": "bed", "bbox": [200, 150, 440, 330], "confidence": 0.8}]
+        features = det.compute_spatial_features(detections, kps, (480, 640))
+
+        bed_idx = det._class_to_idx["bed"]
+        assert features[bed_idx * 4 + 0] == 1.0  # present
+        assert features[bed_idx * 4 + 1] > 0.5   # high proximity (overlapping)
+
+
+class TestContextRules:
+    def test_no_person_suppresses_fall(self):
+        """No person detected should suppress fall probability."""
+        from stream_detect import apply_context_rules
+        probs = np.ones(7, dtype=np.float32) / 7
+        fall_before = probs[0]  # CLASS_TO_IDX["fall"] = 0
+        result = apply_context_rules(probs, False, np.zeros(32), [])
+        # Fall should be suppressed
+        assert result[0] < fall_before
+
+    def test_probs_renormalized(self):
+        """Output probabilities should sum to 1."""
+        from stream_detect import apply_context_rules
+        probs = np.ones(7, dtype=np.float32) / 7
+        result = apply_context_rules(probs, True, np.zeros(32), [])
+        assert abs(result.sum() - 1.0) < 1e-6
+
+
 class TestFiLMConditioning:
     def test_no_env_features_unchanged_output(self):
         """Model without env_dim=0 produces same output shape."""

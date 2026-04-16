@@ -62,6 +62,7 @@ def extract_features_for_split(
             # TODO: match JSON to source video frame and run detection
             # For now, use zero features — will be filled when
             # facility-specific video data is available
+            print(f"  WARNING: No video source for {json_file.name}, using zero features")
             features = np.zeros(
                 EnvironmentDetector.NUM_CONTEXT_CLASSES * 4,
                 dtype=np.float32,

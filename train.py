@@ -52,37 +52,6 @@ MIXUP_PROB = 0.5     # Probability of applying MixUp to a given batch
 # ============================================================================
 
 
-class TemporalBlock(nn.Module):
-    """1D temporal convolution block with residual connection."""
-
-    def __init__(self, in_ch, out_ch, kernel_size=7, stride=1, dropout=0.3):
-        super().__init__()
-        pad = (kernel_size - 1) // 2
-        self.conv1 = nn.Conv1d(in_ch, out_ch, kernel_size, stride=stride, padding=pad)
-        self.bn1 = nn.BatchNorm1d(out_ch)
-        self.conv2 = nn.Conv1d(out_ch, out_ch, kernel_size, padding=pad)
-        self.bn2 = nn.BatchNorm1d(out_ch)
-        self.dropout = nn.Dropout(dropout)
-        self.act = nn.SiLU(inplace=True)
-
-        if in_ch != out_ch or stride != 1:
-            self.residual = nn.Sequential(
-                nn.Conv1d(in_ch, out_ch, 1, stride=stride),
-                nn.BatchNorm1d(out_ch),
-            )
-        else:
-            self.residual = nn.Identity()
-
-    def forward(self, x):
-        # x: (B, C, T)
-        res = self.residual(x)
-        x = self.act(self.bn1(self.conv1(x)))
-        x = self.dropout(x)
-        x = self.bn2(self.conv2(x))
-        x = self.act(x + res)
-        return x
-
-
 class MultiScaleTemporalBlock(nn.Module):
     """Multi-scale 1D temporal convolution with residual connection.
 
@@ -455,7 +424,10 @@ def main():
     print(f"Train: {len(train_loader.dataset)} | Val: {len(val_loader.dataset)} | Test: {len(test_loader.dataset)}")
     print()
 
-    # Environment conditioning: check if env features exist alongside pose data
+    # Environment conditioning: infrastructure for future facility-specific env features.
+    # FiLM conditioning layers are constructed but remain at identity initialization
+    # (gamma=1, beta=0) until env feature extraction is run on real facility data.
+    # See scripts/extract_env_features.py and docs/roboflow_guide.md.
     env_dim = 0
     env_features_dir = Path("data/env_features")
     if env_features_dir.exists():
