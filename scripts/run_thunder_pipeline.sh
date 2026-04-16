@@ -115,13 +115,52 @@ echo "▶ Step 4: Source-aware train/val/test split"
 python scripts/split_data.py --copy
 echo ""
 
-# ── Step 5: Train ────────────────────────────────────────────────
-echo "▶ Step 5: Training"
+# ── Step 5: Audit training data ─────────────────────────────────
+echo "▶ Step 5: Auditing training data (visual verification)"
+echo ""
+
+python scripts/audit_training_data.py --quick
+echo ""
+echo "  ╔═══════════════════════════════════════════════════════╗"
+echo "  ║  PAUSE: Review data_audit/ before continuing.         ║"
+echo "  ║                                                       ║"
+echo "  ║  Check:                                               ║"
+echo "  ║    data_audit/split_summary.txt   — class counts      ║"
+echo "  ║    data_audit/class_distribution.png — bar chart       ║"
+echo "  ║    data_audit/samples/<class>/    — stick figures      ║"
+echo "  ║                                                       ║"
+echo "  ║  Does each class look right? Labels match motion?     ║"
+echo "  ║  Press Enter to continue training, Ctrl+C to abort.   ║"
+echo "  ╚═══════════════════════════════════════════════════════╝"
+echo ""
+read -r -p "  Continue? [Enter] "
+echo ""
+
+# ── Step 6: Train ────────────────────────────────────────────────
+echo "▶ Step 6: Training"
 echo ""
 
 python train.py
 
 echo ""
+
+# ── Step 7: Post-training audit ──────────────────────────────────
+echo "▶ Step 7: Post-training confusion matrix"
+echo ""
+
+python scripts/audit_training_data.py --checkpoint checkpoints/best_model.pt --quick
+
+echo ""
 echo "╔══════════════════════════════════════════════════════════╗"
 echo "║  ✓ Pipeline Complete                                     ║"
+echo "╠══════════════════════════════════════════════════════════╣"
+echo "║                                                         ║"
+echo "║  Review results:                                        ║"
+echo "║    data_audit/confusion_matrix.png — model accuracy     ║"
+echo "║    data_audit/samples/             — class samples       ║"
+echo "║    checkpoints/best_model.pt       — trained model       ║"
+echo "║                                                         ║"
+echo "║  Copy results to local machine:                         ║"
+echo "║    scp -r thunder:pose-autoresearch/data_audit ./        ║"
+echo "║                                                         ║"
 echo "╚══════════════════════════════════════════════════════════╝"
