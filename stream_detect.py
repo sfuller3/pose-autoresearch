@@ -23,6 +23,7 @@ from __future__ import annotations
 import argparse
 import collections
 import json
+import os
 import time
 from datetime import datetime
 from pathlib import Path
@@ -147,6 +148,125 @@ class PoseExtractor:
         kp_xy = result.keypoints.xy[idx].cpu().numpy()    # (17, 2)
         kp_conf = result.keypoints.conf[idx].cpu().numpy()  # (17,)
         return np.concatenate([kp_xy, kp_conf[:, None]], axis=1)  # (17, 3)
+
+
+# ============================================================================
+# ENVIRONMENT DETECTION (Roboflow)
+# ============================================================================
+
+class EnvironmentDetector:
+    """Roboflow-based object detector for environmental context.
+
+    Detects furniture (beds, chairs, tables) and fixtures (doors, handrails)
+    to provide spatial context to the event classifier.
+
+    Uses Roboflow Inference SDK for edge-optimized inference.
+    """
+
+    # Object classes that affect event classification
+    CONTEXT_CLASSES = {
+        "bed", "chair", "table", "door", "wheelchair",
+        "walker", "handrail", "floor-area",
+    }
+    NUM_CONTEXT_CLASSES = len(CONTEXT_CLASSES)
+
+    def __init__(
+        self,
+        model_id: str,
+        api_key: str | None = None,
+        conf: float = 0.3,
+        infer_interval: int = 15,  # run every N frames (not every frame)
+    ):
+        from inference import get_model
+        self.model = get_model(model_id=model_id, api_key=api_key)
+        self.conf = conf
+        self.infer_interval = infer_interval
+        self._frame_count = 0
+        self._cached_detections: list[dict] = []
+        self._class_list = sorted(self.CONTEXT_CLASSES)
+        self._class_to_idx = {c: i for i, c in enumerate(self._class_list)}
+
+    def detect(self, frame_bgr: np.ndarray) -> list[dict]:
+        """Run object detection (or return cached result if not due).
+
+        Returns list of dicts: [{"class": str, "bbox": [x1,y1,x2,y2],
+                                  "confidence": float}, ...]
+        """
+        self._frame_count += 1
+        if self._frame_count % self.infer_interval != 1 and self._cached_detections:
+            return self._cached_detections
+
+        results = self.model.infer(frame_bgr, confidence=self.conf)
+
+        detections = []
+        if hasattr(results, "predictions"):
+            for pred in results.predictions:
+                cls_name = pred.class_name.lower().replace(" ", "-")
+                if cls_name in self.CONTEXT_CLASSES:
+                    detections.append({
+                        "class": cls_name,
+                        "bbox": [pred.x - pred.width/2, pred.y - pred.height/2,
+                                 pred.x + pred.width/2, pred.y + pred.height/2],
+                        "confidence": pred.confidence,
+                    })
+
+        self._cached_detections = detections
+        return detections
+
+    def compute_spatial_features(
+        self,
+        detections: list[dict],
+        keypoints: np.ndarray | None,
+        frame_shape: tuple[int, int],
+    ) -> np.ndarray:
+        """Compute spatial relationship features between person and objects.
+
+        Returns a fixed-size feature vector encoding:
+        - Per-class: present (0/1), nearest distance to person center,
+          relative position (above/below/left/right), overlap ratio
+        - Total: NUM_CONTEXT_CLASSES * 4 = 32 features
+
+        Args:
+            detections: output from detect()
+            keypoints: (17, 3) array or None
+            frame_shape: (height, width)
+        """
+        h, w = frame_shape
+        num_features = self.NUM_CONTEXT_CLASSES * 4
+        features = np.zeros(num_features, dtype=np.float32)
+
+        if keypoints is None or len(detections) == 0:
+            return features
+
+        # Person center (hip midpoint if available, else bbox center)
+        hip_l = keypoints[11, :2]
+        hip_r = keypoints[12, :2]
+        if keypoints[11, 2] > 0.1 and keypoints[12, 2] > 0.1:
+            person_center = (hip_l + hip_r) / 2
+        else:
+            valid = keypoints[keypoints[:, 2] > 0.1, :2]
+            if len(valid) == 0:
+                return features
+            person_center = valid.mean(axis=0)
+
+        px, py = person_center / np.array([w, h])  # normalize to [0,1]
+
+        for det in detections:
+            cls = det["class"]
+            if cls not in self._class_to_idx:
+                continue
+            idx = self._class_to_idx[cls]
+            x1, y1, x2, y2 = np.array(det["bbox"]) / np.array([w, h, w, h])
+            obj_cx, obj_cy = (x1 + x2) / 2, (y1 + y2) / 2
+
+            base = idx * 4
+            features[base + 0] = 1.0  # present
+            dist = np.sqrt((px - obj_cx)**2 + (py - obj_cy)**2)
+            features[base + 1] = max(0, 1.0 - dist)  # proximity (1=close, 0=far)
+            features[base + 2] = py - obj_cy  # relative Y (-1=person above, +1=below)
+            features[base + 3] = px - obj_cx  # relative X (-1=person left, +1=right)
+
+        return features
 
 
 # ============================================================================
@@ -504,6 +624,17 @@ def run_pipeline(args):
     print("Loading YOLO pose model...")
     source = VideoSource(args.source)
     pose = PoseExtractor(args.yolo_model, device, conf=args.pose_conf)
+
+    env_detector = None
+    if args.env_model:
+        api_key = args.roboflow_key or os.environ.get("ROBOFLOW_API_KEY")
+        print(f"  Loading environment detector: {args.env_model}")
+        env_detector = EnvironmentDetector(
+            model_id=args.env_model,
+            api_key=api_key,
+            infer_interval=args.env_interval,
+        )
+
     buffer = KeypointBuffer(max_len=256, sg_window=args.sg_window, sg_polyorder=args.sg_polyorder)
 
     print("Loading event detection model...")
@@ -541,6 +672,17 @@ def run_pipeline(args):
 
             # 1. Pose estimation
             kps = pose.extract(frame_bgr)
+
+            # Environment context (optional)
+            env_detections = []
+            env_features = np.zeros(EnvironmentDetector.NUM_CONTEXT_CLASSES * 4,
+                                    dtype=np.float32)
+            if env_detector is not None:
+                env_detections = env_detector.detect(frame_bgr)
+                env_features = env_detector.compute_spatial_features(
+                    env_detections, kps, frame_bgr.shape[:2]
+                )
+
             kps_flat = kps.flatten() if kps is not None else np.zeros(INPUT_DIM, dtype=np.float32)
 
             # 2. Buffer keypoints
@@ -648,6 +790,12 @@ def main():
                         help="Savitzky-Golay polynomial order")
     parser.add_argument("--display", action="store_true",
                         help="Show live video with detection overlay")
+    parser.add_argument("--env-model", default=None,
+                        help="Roboflow model ID for environment detection (e.g. 'elder-care/1')")
+    parser.add_argument("--roboflow-key", default=None,
+                        help="Roboflow API key (or set ROBOFLOW_API_KEY env var)")
+    parser.add_argument("--env-interval", type=int, default=15,
+                        help="Run environment detection every N frames")
 
     args = parser.parse_args()
     run_pipeline(args)
