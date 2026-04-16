@@ -466,3 +466,21 @@ class TestMixup:
 
         assert any(l > 0.5 for l in lams), "Expected at least one lambda > 0.5"
         assert any(l < 0.5 for l in lams), "Expected at least one lambda < 0.5"
+
+    def test_mixup_is_reproducible_with_torch_seed(self):
+        """Seeding torch RNG should yield deterministic mixup lambdas."""
+        from train import mixup_data
+
+        x = torch.randn(2, 10, 5)
+        y = torch.zeros(2, dtype=torch.long)
+
+        torch.manual_seed(42)
+        _, _, _, lam_a1 = mixup_data(x, y)
+        _, _, _, lam_a2 = mixup_data(x, y)
+
+        torch.manual_seed(42)
+        _, _, _, lam_b1 = mixup_data(x, y)
+        _, _, _, lam_b2 = mixup_data(x, y)
+
+        assert lam_a1 == lam_b1, f"Expected reproducible lambda, got {lam_a1} vs {lam_b1}"
+        assert lam_a2 == lam_b2, f"Expected reproducible lambda, got {lam_a2} vs {lam_b2}"

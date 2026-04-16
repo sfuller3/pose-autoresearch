@@ -5,7 +5,6 @@ The agent modifies this file to improve validation accuracy.
 
 from __future__ import annotations
 
-import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -43,6 +42,10 @@ BATCH_SIZE = 64
 LEARNING_RATE = 2e-3
 WEIGHT_DECAY = 1e-4
 DROPOUT = 0.3
+
+# MixUp augmentation
+MIXUP_ALPHA = 0.2    # Beta(alpha, alpha) shape parameter; <1 is U-shaped
+MIXUP_PROB = 0.5     # Probability of applying MixUp to a given batch
 
 # ============================================================================
 # MODEL: Lightweight 1D Temporal CNN
@@ -315,10 +318,10 @@ class FocalLoss(nn.Module):
         return focal.mean()
 
 
-def mixup_data(x, y, alpha=0.2):
+def mixup_data(x, y, alpha=MIXUP_ALPHA):
     """Temporal MixUp: blend two sequences with random lambda."""
     if alpha > 0:
-        lam = np.random.beta(alpha, alpha)
+        lam = torch.distributions.Beta(alpha, alpha).sample().item()
     else:
         lam = 1.0
     batch_size = x.size(0)
@@ -340,13 +343,13 @@ def train_epoch(model, dataloader, optimizer, criterion, scheduler, device,
         poses = poses.to(device)
         labels = labels.to(device)
 
-        if use_mixup and np.random.random() < 0.5:
+        if use_mixup and torch.rand(()).item() < MIXUP_PROB:
             poses, labels_a, labels_b, lam = mixup_data(poses, labels)
             logits = model(poses)
             loss = lam * criterion(logits, labels_a) + (1 - lam) * criterion(logits, labels_b)
             preds = torch.argmax(logits, dim=1)
-            correct += (lam * (preds == labels_a).float() +
-                       (1 - lam) * (preds == labels_b).float()).sum().item()
+            # Report accuracy vs original labels (labels_a) — cleaner than the soft proxy.
+            correct += (preds == labels_a).sum().item()
         else:
             logits = model(poses)
             loss = criterion(logits, labels)
