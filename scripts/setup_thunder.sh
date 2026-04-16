@@ -217,17 +217,30 @@ echo ""
 echo "▶ Running smoke test..."
 python3 << 'PYSMOKE'
 import os, time, torch
+from pathlib import Path
 os.environ['POSE_AUTORESEARCH_MAX_TIME'] = '30'
 
-from prepare import get_dataloaders, evaluate_model, DEVICE
-from train import PoseEventClassifier
+from prepare import evaluate_model, DEVICE
+from train import PoseEventClassifier, MultiPersonPoseDataset
 
-train_ld, val_ld, test_ld = get_dataloaders(batch_size=64, num_workers=2)
-print(f"  Data:     {len(train_ld.dataset)} train, {len(val_ld.dataset)} val")
+splits_dir = Path("data/splits")
+if splits_dir.exists() and (splits_dir / "train").exists():
+    from torch.utils.data import DataLoader
+    train_ds = MultiPersonPoseDataset(splits_dir / "train", augment=False)
+    val_ds = MultiPersonPoseDataset(splits_dir / "val", augment=False)
+    train_ld = DataLoader(train_ds, batch_size=64, shuffle=False, num_workers=2)
+    val_ld = DataLoader(val_ds, batch_size=64, shuffle=False, num_workers=2)
+    n_bodies = 2
+    print(f"  Data:     {len(train_ds)} train, {len(val_ds)} val (multi-person)")
+else:
+    from prepare import get_dataloaders
+    train_ld, val_ld, _ = get_dataloaders(batch_size=64, num_workers=2)
+    n_bodies = 1
+    print(f"  Data:     {len(train_ld.dataset)} train, {len(val_ld.dataset)} val (single-person)")
 
-model = PoseEventClassifier().to(DEVICE)
+model = PoseEventClassifier(n_bodies=n_bodies).to(DEVICE)
 params = sum(p.numel() for p in model.parameters())
-print(f"  Model:    {params:,} parameters on {DEVICE}")
+print(f"  Model:    {params:,} parameters on {DEVICE} (n_bodies={n_bodies})")
 
 # Inference timing
 batch = next(iter(train_ld))
@@ -256,13 +269,24 @@ echo ""
 echo "▶ Estimating experiment throughput..."
 python3 << 'PYESTIMATE'
 import os, time, torch, torch.nn as nn
+from pathlib import Path
 os.environ['POSE_AUTORESEARCH_MAX_TIME'] = '60'
 
-from prepare import get_dataloaders, DEVICE
-from train import PoseEventClassifier
+from prepare import DEVICE
+from train import PoseEventClassifier, MultiPersonPoseDataset
 
-train_ld, val_ld, _ = get_dataloaders(batch_size=64, num_workers=2)
-model = PoseEventClassifier().to(DEVICE)
+splits_dir = Path("data/splits")
+if splits_dir.exists() and (splits_dir / "train").exists():
+    from torch.utils.data import DataLoader
+    train_ds = MultiPersonPoseDataset(splits_dir / "train", augment=True)
+    train_ld = DataLoader(train_ds, batch_size=64, shuffle=True, num_workers=2)
+    n_bodies = 2
+else:
+    from prepare import get_dataloaders
+    train_ld, _, _ = get_dataloaders(batch_size=64, num_workers=2)
+    n_bodies = 1
+
+model = PoseEventClassifier(n_bodies=n_bodies).to(DEVICE)
 optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
 criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
 
@@ -285,7 +309,7 @@ epoch_time = time.time() - t0
 epochs_per_5min = int(300 / epoch_time)
 experiment_time = 305
 experiments_per_hour = 3600 / experiment_time
-hourly_cost = 0.27  # A6000 prototyping tier
+hourly_cost = 1.10  # A100 GPU tier
 
 print(f"  Epoch time:             {epoch_time:.1f}s")
 print(f"  Epochs per 5min run:    ~{epochs_per_5min}")
