@@ -18,13 +18,17 @@ from prepare import (
     evaluate_model,
     evaluate_per_class,
     BONE_PAIRS,
+    CLASS_TO_IDX,
     DEVICE,
     EVENT_CLASSES,
     MAX_TIME_BUDGET_SECONDS,
     NUM_KEYPOINTS,
     NUM_BONES,
 )
+from pose_autoresearch.augment import augment_pose_sequence
 from collections import Counter
+import json
+import numpy as np
 
 # ============================================================================
 # HYPERPARAMETERS (agent can modify)
@@ -34,6 +38,8 @@ INPUT_DIM = 51       # 17 keypoints x 3 (x, y, confidence)
 BONE_DIM = NUM_BONES * 3  # 16 bones x 3 (dx, dy, mean_conf)
 VELOCITY_DIM = 51    # 17 keypoints x 3 (vx, vy, confidence)
 FULL_INPUT_DIM = INPUT_DIM + BONE_DIM + VELOCITY_DIM  # 51 + 48 + 51 = 150
+MULTI_INPUT_DIM = 105    # 51 + 51 + 3 (primary + neighbor + metadata)
+MULTI_FULL_INPUT_DIM = 303  # 150 + 150 + 3
 INPUT_CHANNELS = 3   # Per-joint: x, y, confidence
 NUM_JOINTS = NUM_KEYPOINTS  # 17
 NUM_CLASSES = len(EVENT_CLASSES)  # 7
@@ -46,6 +52,149 @@ DROPOUT = 0.3
 # MixUp augmentation
 MIXUP_ALPHA = 0.2    # Beta(alpha, alpha) shape parameter; <1 is U-shaped
 MIXUP_PROB = 0.5     # Probability of applying MixUp to a given batch
+
+# ============================================================================
+# MULTI-PERSON DATASET
+# ============================================================================
+
+
+class MultiPersonPoseDataset(torch.utils.data.Dataset):
+    """Dataset that pairs primary and neighbor bodies for multi-person tracking.
+
+    Each JSON sample may contain a ``bodies`` list with multiple detected people.
+    When two or more bodies are present, the dataset produces *two* training
+    examples per sample (pair flipping) to double interaction data.  Metadata
+    features (distance, relative position) are computed from hip midpoints.
+    """
+
+    # Hip joint indices in COCO-17 format
+    LEFT_HIP = 11
+    RIGHT_HIP = 12
+    # Approximate frame diagonal for distance normalization (640x480 default)
+    FRAME_DIAG = (640 ** 2 + 480 ** 2) ** 0.5
+
+    def __init__(self, data_dir, seq_len: int = 150, augment: bool = False):
+        self.seq_len = seq_len
+        self.augment = augment
+        self.samples: list[tuple[np.ndarray, np.ndarray, np.ndarray, int]] = []
+        # Each entry is (primary_kps, neighbor_kps, metadata, label_idx)
+        # primary_kps/neighbor_kps: (T, 51)   metadata: (T, 3)
+
+        data_dir = Path(data_dir)
+        for json_path in sorted(data_dir.glob("*.json")):
+            with open(json_path) as f:
+                data = json.load(f)
+
+            label_str = data["label"]
+            if label_str not in CLASS_TO_IDX:
+                continue
+            label = CLASS_TO_IDX[label_str]
+
+            frames = data["frames"]
+            T = len(frames)
+
+            # Extract body 0 (primary) keypoints — always present
+            primary = np.zeros((T, 17, 3), dtype=np.float32)
+            for t, frame in enumerate(frames):
+                kps = np.array(frame["keypoints"], dtype=np.float32).reshape(17, 3)
+                primary[t] = kps
+
+            # Check for multi-body data
+            has_neighbor = False
+            neighbor = np.zeros((T, 17, 3), dtype=np.float32)
+            for t, frame in enumerate(frames):
+                bodies = frame.get("bodies")
+                if bodies is not None and len(bodies) >= 2:
+                    has_neighbor = True
+                    nb = np.array(bodies[1], dtype=np.float32).reshape(17, 3)
+                    neighbor[t] = nb
+
+            # Compute metadata from hip midpoints
+            metadata = self._compute_metadata(primary, neighbor)
+
+            # Flatten to (T, 51)
+            primary_flat = primary.reshape(T, 51)
+            neighbor_flat = neighbor.reshape(T, 51)
+
+            self.samples.append((primary_flat, neighbor_flat, metadata, label))
+
+            # Pair flipping: if we have a real neighbor, also add the reverse
+            if has_neighbor:
+                rev_metadata = self._compute_metadata(neighbor, primary)
+                self.samples.append((
+                    neighbor.reshape(T, 51),
+                    primary.reshape(T, 51),
+                    rev_metadata,
+                    label,
+                ))
+
+    def _compute_metadata(self, primary: np.ndarray, neighbor: np.ndarray) -> np.ndarray:
+        """Compute per-frame metadata (3 dims) from hip midpoints.
+
+        Args:
+            primary: (T, 17, 3) keypoints for the primary person
+            neighbor: (T, 17, 3) keypoints for the neighbor person
+
+        Returns:
+            metadata: (T, 3) — [dist_norm, relative_x, relative_y]
+        """
+        T = primary.shape[0]
+        metadata = np.zeros((T, 3), dtype=np.float32)
+
+        p_hip = (primary[:, self.LEFT_HIP, :2] + primary[:, self.RIGHT_HIP, :2]) / 2  # (T, 2)
+        n_hip = (neighbor[:, self.LEFT_HIP, :2] + neighbor[:, self.RIGHT_HIP, :2]) / 2  # (T, 2)
+
+        diff = n_hip - p_hip  # (T, 2)
+        dist = np.linalg.norm(diff, axis=1)  # (T,)
+
+        metadata[:, 0] = dist / self.FRAME_DIAG  # normalized euclidean distance
+        metadata[:, 1] = diff[:, 0] / (self.FRAME_DIAG + 1e-8)  # relative_x
+        metadata[:, 2] = diff[:, 1] / (self.FRAME_DIAG + 1e-8)  # relative_y
+
+        return metadata
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        primary, neighbor, metadata, label = self.samples[idx]
+        T = primary.shape[0]
+
+        # Augmentation: apply independently to both bodies.
+        # Independent augmentation adds slight spatial noise to the
+        # inter-person relationship, acting as regularization.
+        if self.augment:
+            p_tensor = torch.from_numpy(primary.reshape(T, 17, 3).copy())
+            p_tensor = augment_pose_sequence(p_tensor)
+            primary = p_tensor.numpy().reshape(T, 51)
+
+            # Augment neighbor too (if present, i.e., not all-zero)
+            if neighbor.any():
+                n_tensor = torch.from_numpy(neighbor.reshape(T, 17, 3).copy())
+                n_tensor = augment_pose_sequence(n_tensor)
+                neighbor = n_tensor.numpy().reshape(T, 51)
+                # Recompute metadata after augmentation since positions changed
+                metadata = self._compute_metadata(
+                    p_tensor.numpy().reshape(T, 17, 3),
+                    n_tensor.numpy().reshape(T, 17, 3),
+                )
+
+        # Pad or truncate to seq_len
+        if T >= self.seq_len:
+            primary = primary[:self.seq_len]
+            neighbor = neighbor[:self.seq_len]
+            metadata = metadata[:self.seq_len]
+        else:
+            pad_len = self.seq_len - T
+            primary = np.concatenate([primary, np.zeros((pad_len, 51), dtype=np.float32)])
+            neighbor = np.concatenate([neighbor, np.zeros((pad_len, 51), dtype=np.float32)])
+            metadata = np.concatenate([metadata, np.zeros((pad_len, 3), dtype=np.float32)])
+
+        # Concatenate: primary(51) + neighbor(51) + metadata(3) = 105
+        combined = np.concatenate([primary, neighbor, metadata], axis=1)
+
+        return torch.tensor(combined, dtype=torch.float32), torch.tensor(label, dtype=torch.long)
+
 
 # ============================================================================
 # MODEL: Lightweight 1D Temporal CNN
@@ -182,11 +331,16 @@ class PoseEventClassifier(nn.Module):
         num_classes: int = NUM_CLASSES,
         dropout: float = DROPOUT,
         env_dim: int = 0,  # 0 = no environment conditioning
+        n_bodies: int = 1,  # 1 = single-body (51-dim), 2 = dual-body (105-dim)
     ):
         super().__init__()
         self.env_dim = env_dim
+        self.n_bodies = n_bodies
 
-        in_dim = FULL_INPUT_DIM  # joint(51) + bone(48) + velocity(51) = 150
+        if n_bodies == 2:
+            in_dim = MULTI_FULL_INPUT_DIM  # 150 + 150 + 3 = 303
+        else:
+            in_dim = FULL_INPUT_DIM  # joint(51) + bone(48) + velocity(51) = 150
 
         # Channel progression for temporal blocks. The last value is the
         # feature dim consumed by the pool and classifier head.
@@ -215,37 +369,31 @@ class PoseEventClassifier(nn.Module):
 
         self.fc = nn.Linear(final_channels, num_classes)
 
-    def forward(self, x, env_features=None):
-        """
+    def _process_body(self, kps):
+        """Compute confidence gating, bones, and velocity for one body.
+
         Args:
-            x: (batch, seq_len, 51) -- flattened keypoints
-            env_features: optional (batch, env_dim) -- environment context
+            kps: (B, T, 17, 3) raw keypoints
+
         Returns:
-            logits: (batch, num_classes)
+            features: (B, T, 150) — gated_joints(51) + bones(48) + velocity(51)
         """
-        B, T, D = x.shape
+        B, T = kps.shape[:2]
 
-        # Compute bone and velocity features in pure PyTorch (stays on GPU)
-        kps = x.view(B, T, NUM_JOINTS, 3)  # (B, T, 17, 3)
-
-        # Velocity: frame-to-frame displacement (uses raw kps; velocity stream
-        # carries its own conf channel, so we don't gate it here)
+        # Velocity: frame-to-frame displacement
         vel = torch.zeros_like(kps)
         vel[:, 1:, :, :2] = kps[:, 1:, :, :2] - kps[:, :-1, :, :2]
         vel[:, :, :, 2] = kps[:, :, :, 2]  # keep confidence
         vel_flat = vel.reshape(B, T, -1)  # (B, T, 51)
 
-        # Confidence gating: attenuate features from low-confidence joints.
-        # This prevents noisy YOLO detections from dominating the representation.
-        # sigmoid(conf*5 - 2): conf<0.2 -> ~0.12, conf=0.4 -> 0.5, conf>0.6 -> ~0.73+
+        # Confidence gating
         conf = kps[:, :, :, 2:3]  # (B, T, 17, 1)
         conf_gate = torch.sigmoid(conf * 5 - 2)
         gated_kps = kps.clone()
         gated_kps[:, :, :, :2] = kps[:, :, :, :2] * conf_gate
-        x_gated = gated_kps.reshape(B, T, -1)  # (B, T, 51) with gated coords
+        x_gated = gated_kps.reshape(B, T, -1)  # (B, T, 51)
 
-        # Bones: vectors between connected joints (computed from gated coords so
-        # zero-confidence joints contribute zero displacement rather than noise)
+        # Bones
         bone_parts = []
         for parent, child in BONE_PAIRS:
             dx = gated_kps[:, :, child, 0] - gated_kps[:, :, parent, 0]
@@ -254,11 +402,45 @@ class PoseEventClassifier(nn.Module):
             bone_parts.append(torch.stack([dx, dy, bone_conf], dim=2))  # (B, T, 3)
         bones_flat = torch.cat(bone_parts, dim=2)  # (B, T, 48)
 
-        # Concatenate joint + bone + velocity
-        x = torch.cat([x_gated, bones_flat, vel_flat], dim=2)  # (B, T, 150)
+        return torch.cat([x_gated, bones_flat, vel_flat], dim=2)  # (B, T, 150)
+
+    def forward(self, x, env_features=None):
+        """
+        Args:
+            x: (batch, seq_len, D) -- D=51 for single-body, D=105 for dual-body
+            env_features: optional (batch, env_dim) -- environment context
+        Returns:
+            logits: (batch, num_classes)
+        """
+        B, T, D = x.shape
+
+        if self.n_bodies == 2:
+            # Split input: primary(51) + neighbor(51) + metadata(3)
+            primary_raw = x[:, :, :51]
+            neighbor_raw = x[:, :, 51:102]
+            metadata = x[:, :, 102:105]  # (B, T, 3)
+
+            primary_kps = primary_raw.view(B, T, NUM_JOINTS, 3)
+            neighbor_kps = neighbor_raw.view(B, T, NUM_JOINTS, 3)
+
+            primary_feats = self._process_body(primary_kps)   # (B, T, 150)
+            neighbor_feats = self._process_body(neighbor_kps)  # (B, T, 150)
+
+            # Soft distance decay: attenuate neighbor when far away
+            # dist_norm is metadata[:,:,0]
+            dist_norm = metadata[:, :, 0:1]  # (B, T, 1)
+            decay = torch.sigmoid(5 - dist_norm * 10)  # (B, T, 1)
+            neighbor_feats = neighbor_feats * decay
+
+            # Concatenate: primary(150) + neighbor(150) + metadata(3) = 303
+            x = torch.cat([primary_feats, neighbor_feats, metadata], dim=2)
+        else:
+            # Single-body path: identical to original behavior
+            kps = x.view(B, T, NUM_JOINTS, 3)  # (B, T, 17, 3)
+            x = self._process_body(kps)  # (B, T, 150)
 
         # Input normalization
-        x = x.permute(0, 2, 1)  # (B, 150, T)
+        x = x.permute(0, 2, 1)  # (B, C, T)
         x = self.input_bn(x)
 
         # Temporal blocks with optional FiLM conditioning
@@ -393,12 +575,14 @@ def main():
     print(f"Time Budget: {MAX_TIME_BUDGET_SECONDS}s")
     print("=" * 70)
 
+    n_bodies = 1
     splits_dir = Path("data/splits")
     if splits_dir.exists() and (splits_dir / "train").exists():
-        print("Loading from pre-split directories (data/splits/)")
-        train_ds = PoseDataset(splits_dir / "train", augment=True)
-        val_ds = PoseDataset(splits_dir / "val", augment=False)
-        test_ds = PoseDataset(splits_dir / "test", augment=False)
+        print("Loading from pre-split directories (data/splits/) with multi-person tracking")
+        n_bodies = 2
+        train_ds = MultiPersonPoseDataset(splits_dir / "train", seq_len=SEQ_LEN, augment=True)
+        val_ds = MultiPersonPoseDataset(splits_dir / "val", seq_len=SEQ_LEN, augment=False)
+        test_ds = MultiPersonPoseDataset(splits_dir / "test", seq_len=SEQ_LEN, augment=False)
 
         pin = DEVICE.type == "cuda"
         train_loader = DataLoader(
@@ -437,6 +621,7 @@ def main():
     model = PoseEventClassifier(
         dropout=DROPOUT,
         env_dim=env_dim,
+        n_bodies=n_bodies,
     ).to(DEVICE)
 
     num_params = sum(p.numel() for p in model.parameters())

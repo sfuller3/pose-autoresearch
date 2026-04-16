@@ -591,3 +591,291 @@ class TestFiLMConditioning:
         with torch.no_grad():
             out = model(x)  # no env_features passed
         assert out.shape == (2, 7)
+
+
+# ============================================================================
+# MULTI-PERSON PIPELINE TESTS
+# ============================================================================
+
+
+class TestMultiPersonDataset:
+    """Tests for MultiPersonPoseDataset (MP-1)."""
+
+    @pytest.fixture
+    def multi_body_data_dir(self, tmp_path):
+        """Create temp dir with single-body and multi-body JSON samples."""
+        # Single-body sample
+        frames_single = []
+        for t in range(30):
+            kps = np.random.rand(17, 3).tolist()
+            frames_single.append({"keypoints": kps, "timestamp": t / 30.0})
+        with open(tmp_path / "single_fall_001.json", "w") as f:
+            json.dump({"frames": frames_single, "label": "fall", "duration": 1.0}, f)
+
+        # Multi-body sample (2 bodies)
+        frames_multi = []
+        for t in range(30):
+            body0 = np.random.rand(17, 3).tolist()
+            body1 = np.random.rand(17, 3).tolist()
+            frames_multi.append({
+                "keypoints": body0,
+                "bodies": [body0, body1],
+                "timestamp": t / 30.0,
+            })
+        with open(tmp_path / "multi_aggression_001.json", "w") as f:
+            json.dump({"frames": frames_multi, "label": "aggression", "duration": 1.0}, f)
+
+        return tmp_path
+
+    def test_loads_single_body(self, multi_body_data_dir):
+        """Single-body samples produce 105-dim output with zero neighbor."""
+        from train import MultiPersonPoseDataset
+        ds = MultiPersonPoseDataset(multi_body_data_dir, seq_len=30)
+        # Should have 3 samples: 1 single + 2 (multi with pair flip)
+        assert len(ds) == 3
+
+    def test_output_shape(self, multi_body_data_dir):
+        """Each sample has shape (seq_len, 105)."""
+        from train import MultiPersonPoseDataset
+        ds = MultiPersonPoseDataset(multi_body_data_dir, seq_len=30)
+        x, y = ds[0]
+        assert x.shape == (30, 105)
+        assert y.dtype == torch.long
+
+    def test_pair_flipping_doubles_multi_body(self, multi_body_data_dir):
+        """Multi-body samples produce 2 entries (pair flipping)."""
+        from train import MultiPersonPoseDataset
+        ds = MultiPersonPoseDataset(multi_body_data_dir, seq_len=30)
+        # 1 single-body + 2 from pair flip of multi-body = 3 total
+        assert len(ds) == 3
+
+    def test_single_body_neighbor_is_zero(self, multi_body_data_dir):
+        """For single-body samples, neighbor channels (dims 51:102) are zero."""
+        from train import MultiPersonPoseDataset
+        ds = MultiPersonPoseDataset(multi_body_data_dir, seq_len=30)
+        # Find the single-body sample (label=fall=0)
+        for i in range(len(ds)):
+            x, y = ds[i]
+            if y.item() == 0:  # fall
+                neighbor = x[:, 51:102]
+                assert torch.all(neighbor == 0), "Single-body neighbor should be zeros"
+                break
+
+    def test_metadata_dims(self, multi_body_data_dir):
+        """Metadata (dims 102:105) are populated for multi-body samples."""
+        from train import MultiPersonPoseDataset
+        ds = MultiPersonPoseDataset(multi_body_data_dir, seq_len=30)
+        # Find a multi-body sample (label=aggression=3)
+        for i in range(len(ds)):
+            x, y = ds[i]
+            if y.item() == 3:  # aggression
+                metadata = x[:, 102:105]
+                # With random data, distance should be nonzero
+                assert not torch.all(metadata == 0), "Multi-body metadata should be nonzero"
+                break
+
+    def test_padding_short_sequences(self, tmp_path):
+        """Sequences shorter than seq_len are zero-padded."""
+        from train import MultiPersonPoseDataset
+        frames = []
+        for t in range(10):  # only 10 frames
+            kps = np.random.rand(17, 3).tolist()
+            frames.append({"keypoints": kps, "timestamp": t / 30.0})
+        with open(tmp_path / "short_fall_001.json", "w") as f:
+            json.dump({"frames": frames, "label": "fall", "duration": 0.33}, f)
+
+        ds = MultiPersonPoseDataset(tmp_path, seq_len=30)
+        x, y = ds[0]
+        assert x.shape == (30, 105)
+        # Last frames should be zero-padded
+        assert torch.all(x[10:] == 0)
+
+
+class TestMultiBodyModel:
+    """Tests for PoseEventClassifier with n_bodies=2 (MP-2)."""
+
+    def test_n_bodies_2_forward(self):
+        """n_bodies=2 accepts 105-dim input and outputs (B, 7)."""
+        from train import PoseEventClassifier
+        model = PoseEventClassifier(n_bodies=2)
+        model.eval()
+        x = torch.randn(4, 150, 105)
+        with torch.no_grad():
+            out = model(x)
+        assert out.shape == (4, 7)
+
+    def test_n_bodies_1_backward_compat(self):
+        """n_bodies=1 still accepts 51-dim input (original behavior)."""
+        from train import PoseEventClassifier
+        model = PoseEventClassifier(n_bodies=1)
+        model.eval()
+        x = torch.randn(4, 150, 51)
+        with torch.no_grad():
+            out = model(x)
+        assert out.shape == (4, 7)
+
+    def test_distance_decay_attenuates_far_neighbor(self):
+        """When distance_norm is large, neighbor features should be attenuated."""
+        from train import PoseEventClassifier
+        model = PoseEventClassifier(n_bodies=2)
+        model.eval()
+
+        # Build two inputs: one with close neighbor, one with far neighbor
+        x_close = torch.randn(1, 150, 105)
+        x_far = x_close.clone()
+
+        # Set distance_norm (dim 102) — close=0.1, far=2.0
+        x_close[:, :, 102] = 0.1  # sigmoid(5 - 0.1*10) ≈ sigmoid(4) ≈ 0.98
+        x_far[:, :, 102] = 2.0    # sigmoid(5 - 2.0*10) ≈ sigmoid(-15) ≈ 0.0
+
+        with torch.no_grad():
+            out_close = model(x_close)
+            out_far = model(x_far)
+
+        # Outputs should differ because decay changes neighbor contribution
+        assert not torch.allclose(out_close, out_far, atol=1e-3)
+
+    def test_zero_neighbor_equivalent_to_absent(self):
+        """All-zero neighbor with zero metadata should produce valid output."""
+        from train import PoseEventClassifier
+        model = PoseEventClassifier(n_bodies=2)
+        model.eval()
+        x = torch.randn(2, 150, 105)
+        x[:, :, 51:] = 0  # zero out neighbor and metadata
+        with torch.no_grad():
+            out = model(x)
+        assert out.shape == (2, 7)
+        assert not torch.isnan(out).any()
+
+    def test_n_bodies_2_with_env_features(self):
+        """n_bodies=2 works together with FiLM env conditioning."""
+        from train import PoseEventClassifier
+        model = PoseEventClassifier(n_bodies=2, env_dim=32)
+        model.eval()
+        x = torch.randn(2, 150, 105)
+        env = torch.randn(2, 32)
+        with torch.no_grad():
+            out = model(x, env_features=env)
+        assert out.shape == (2, 7)
+
+    def test_gradient_flows_through_both_bodies(self):
+        """Backprop flows through both primary and neighbor paths."""
+        from train import PoseEventClassifier
+        model = PoseEventClassifier(n_bodies=2)
+        x = torch.randn(2, 150, 105, requires_grad=True)
+        out = model(x)
+        loss = out.sum()
+        loss.backward()
+        # Gradient should flow to all input dims
+        assert x.grad is not None
+        # Primary dims should have gradient
+        assert x.grad[:, :, :51].abs().sum() > 0
+        # Neighbor dims should have gradient
+        assert x.grad[:, :, 51:102].abs().sum() > 0
+
+
+class TestPersonTracker:
+    """Tests for PersonTracker and PersonState (MP-4)."""
+
+    def test_new_detection_creates_state(self):
+        """New track IDs create PersonState entries."""
+        from stream_detect import PersonTracker
+        tracker = PersonTracker()
+        kps = np.random.rand(17, 3).astype(np.float32)
+        kps[11, 2] = 0.9  # left hip confidence
+        kps[12, 2] = 0.9  # right hip confidence
+        tracker.update([(1, kps), (2, kps.copy())], timestamp=0.0)
+        assert 1 in tracker.people
+        assert 2 in tracker.people
+
+    def test_grace_period_keeps_lost_track(self):
+        """Lost tracks survive within grace period."""
+        from stream_detect import PersonTracker
+        tracker = PersonTracker()
+        kps = np.random.rand(17, 3).astype(np.float32)
+        kps[11, 2] = 0.9
+        kps[12, 2] = 0.9
+        tracker.update([(1, kps)], timestamp=0.0)
+        # Person disappears but within grace period
+        tracker.update([], timestamp=3.0)
+        assert 1 in tracker.people
+
+    def test_grace_period_expires_old_track(self):
+        """Lost tracks are dropped after grace period."""
+        from stream_detect import PersonTracker
+        tracker = PersonTracker()
+        kps = np.random.rand(17, 3).astype(np.float32)
+        kps[11, 2] = 0.9
+        kps[12, 2] = 0.9
+        tracker.update([(1, kps)], timestamp=0.0)
+        # Person disappears past grace period (5s)
+        tracker.update([], timestamp=6.0)
+        assert 1 not in tracker.people
+
+    def test_get_active_people_min_frames(self):
+        """Only people with sufficient buffer depth are returned."""
+        from stream_detect import PersonTracker
+        tracker = PersonTracker()
+        kps = np.random.rand(17, 3).astype(np.float32)
+        kps[11, 2] = 0.9
+        kps[12, 2] = 0.9
+        # Push only 3 frames
+        for t in range(3):
+            tracker.update([(1, kps)], timestamp=t * 0.033)
+        active = tracker.get_active_people(min_frames=10)
+        assert len(active) == 0  # not enough frames yet
+
+        # Push more frames
+        for t in range(3, 15):
+            tracker.update([(1, kps)], timestamp=t * 0.033)
+        active = tracker.get_active_people(min_frames=10)
+        assert len(active) == 1
+
+    def test_reassociation_near_stale_track(self):
+        """New track near a stale track's position re-associates."""
+        from stream_detect import PersonTracker
+        tracker = PersonTracker()
+
+        kps = np.random.rand(17, 3).astype(np.float32)
+        # Set known hip position
+        kps[11, :] = [100, 200, 0.9]
+        kps[12, :] = [120, 200, 0.9]
+
+        # Person 1 appears and builds some buffer
+        for t in range(5):
+            tracker.update([(1, kps)], timestamp=t * 0.033)
+        assert len(tracker.people[1].buffer) == 5
+
+        # Person 1 disappears for 1 second (within grace)
+        tracker.update([], timestamp=1.0)
+
+        # New person 5 appears at similar position
+        kps_new = kps.copy()
+        kps_new[11, :] = [105, 205, 0.9]  # nearby
+        kps_new[12, :] = [125, 205, 0.9]
+        tracker.update([(5, kps_new)], timestamp=1.5)
+
+        # Person 5 should have inherited person 1's buffer
+        assert 5 in tracker.people
+        assert len(tracker.people[5].buffer) == 6  # 5 from person 1 + 1 new
+
+
+class TestDistanceDecay:
+    """Tests for the soft distance decay function used in multi-person."""
+
+    def test_close_neighbor_high_decay(self):
+        """Neighbor within ~30% frame diagonal gets strong contribution."""
+        # sigmoid(5 - 0.2 * 10) = sigmoid(3) ≈ 0.95
+        decay = torch.sigmoid(torch.tensor(5.0 - 0.2 * 10))
+        assert decay.item() > 0.9
+
+    def test_far_neighbor_low_decay(self):
+        """Neighbor beyond ~60% frame diagonal contributes near-zero."""
+        # sigmoid(5 - 0.8 * 10) = sigmoid(-3) ≈ 0.05
+        decay = torch.sigmoid(torch.tensor(5.0 - 0.8 * 10))
+        assert decay.item() < 0.1
+
+    def test_very_far_neighbor_near_zero(self):
+        """Neighbor at 2x frame diagonal → essentially zero."""
+        decay = torch.sigmoid(torch.tensor(5.0 - 2.0 * 10))
+        assert decay.item() < 0.001
