@@ -574,6 +574,50 @@ class AlertDispatcher:
 # DISPLAY OVERLAY
 # ============================================================================
 
+# Colors for environment objects (BGR)
+ENV_COLORS = {
+    "bed":        (200, 150, 50),   # teal
+    "chair":      (50, 200, 50),    # green
+    "table":      (50, 150, 200),   # amber
+    "door":       (200, 100, 200),  # pink
+    "wheelchair": (100, 200, 200),  # yellow
+    "walker":     (200, 200, 100),  # cyan
+    "handrail":   (100, 100, 200),  # salmon
+    "floor-area": (150, 150, 150),  # gray
+}
+
+
+def draw_environment(
+    frame: np.ndarray,
+    detections: list[dict],
+    alpha: float = 0.4,
+) -> np.ndarray:
+    """Draw environment object bounding boxes on frame."""
+    if not detections:
+        return frame
+
+    overlay = frame.copy()
+    font = cv2.FONT_HERSHEY_SIMPLEX
+
+    for det in detections:
+        cls = det["class"]
+        bbox = det["bbox"]
+        conf = det["confidence"]
+        color = ENV_COLORS.get(cls, (180, 180, 180))
+
+        x1, y1, x2, y2 = [int(v) for v in bbox]
+        cv2.rectangle(overlay, (x1, y1), (x2, y2), color, 2, cv2.LINE_AA)
+
+        label = f"{cls} {conf:.0%}"
+        (tw, th), _ = cv2.getTextSize(label, font, 0.4, 1)
+        cv2.rectangle(overlay, (x1, y1 - th - 6), (x1 + tw + 4, y1), color, -1)
+        cv2.putText(overlay, label, (x1 + 2, y1 - 4),
+                    font, 0.4, (255, 255, 255), 1, cv2.LINE_AA)
+
+    cv2.addWeighted(overlay, alpha, frame, 1 - alpha, 0, frame)
+    return frame
+
+
 def draw_overlay(frame: np.ndarray, smoother: EventSmoother, fps: float) -> np.ndarray:
     """Draw detection status overlay on frame."""
     overlay = frame.copy()
@@ -720,6 +764,10 @@ def run_pipeline(args):
             current_fps = 1.0 / (sum(frame_times) / len(frame_times)) if frame_times else 0
 
             if args.display:
+                # Draw environment objects
+                if env_detector is not None and env_detections:
+                    draw_environment(frame_bgr, env_detections)
+
                 display = draw_overlay(frame_bgr, smoother, current_fps)
                 cv2.imshow("Stream Detect", display)
                 if cv2.waitKey(1) & 0xFF == ord("q"):
