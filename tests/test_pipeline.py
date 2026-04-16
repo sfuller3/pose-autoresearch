@@ -484,3 +484,53 @@ class TestMixup:
 
         assert lam_a1 == lam_b1, f"Expected reproducible lambda, got {lam_a1} vs {lam_b1}"
         assert lam_a2 == lam_b2, f"Expected reproducible lambda, got {lam_a2} vs {lam_b2}"
+
+
+class TestFiLMConditioning:
+    def test_no_env_features_unchanged_output(self):
+        """Model without env_dim=0 produces same output shape."""
+        from train import PoseEventClassifier
+
+        model = PoseEventClassifier(env_dim=0)
+        model.eval()
+        x = torch.randn(2, 150, 51)
+        with torch.no_grad():
+            out = model(x)
+        assert out.shape == (2, 7)
+
+    def test_with_env_features_produces_output(self):
+        """Model with env_dim=32 accepts environment features."""
+        from train import PoseEventClassifier
+
+        model = PoseEventClassifier(env_dim=32)
+        model.eval()
+        x = torch.randn(2, 150, 51)
+        env = torch.randn(2, 32)
+        with torch.no_grad():
+            out = model(x, env_features=env)
+        assert out.shape == (2, 7)
+
+    def test_env_features_affect_output(self):
+        """Environment features should change model output."""
+        from train import PoseEventClassifier
+
+        model = PoseEventClassifier(env_dim=32)
+        model.eval()
+        x = torch.randn(2, 150, 51)
+        env_a = torch.zeros(2, 32)
+        env_b = torch.ones(2, 32)
+        with torch.no_grad():
+            out_a = model(x, env_features=env_a)
+            out_b = model(x, env_features=env_b)
+        assert not torch.allclose(out_a, out_b, atol=1e-4)
+
+    def test_backward_compat_no_env(self):
+        """Forward without env_features works (backward compatible)."""
+        from train import PoseEventClassifier
+
+        model = PoseEventClassifier(env_dim=32)
+        model.eval()
+        x = torch.randn(2, 150, 51)
+        with torch.no_grad():
+            out = model(x)  # no env_features passed
+        assert out.shape == (2, 7)

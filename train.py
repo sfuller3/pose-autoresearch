@@ -177,6 +177,28 @@ class TemporalAttentionPool(nn.Module):
         return pooled
 
 
+class EnvironmentConditioner(nn.Module):
+    """FiLM conditioning: environment features modulate temporal CNN channels.
+
+    Given environment context vector, produces per-channel scale and shift
+    that are applied after each temporal block's batch norm.
+    """
+
+    def __init__(self, env_dim: int, channel_dim: int):
+        super().__init__()
+        self.fc = nn.Sequential(
+            nn.Linear(env_dim, channel_dim),
+            nn.SiLU(),
+            nn.Linear(channel_dim, channel_dim * 2),  # gamma + beta
+        )
+
+    def forward(self, env_features: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Returns (gamma, beta) each of shape (B, C)."""
+        out = self.fc(env_features)  # (B, 2*C)
+        gamma, beta = out.chunk(2, dim=-1)
+        return 1 + gamma, beta  # gamma centered at 1 for identity init
+
+
 class PoseEventClassifier(nn.Module):
     """Lightweight 1D temporal CNN for pose event classification.
 
@@ -190,8 +212,10 @@ class PoseEventClassifier(nn.Module):
         num_joints: int = NUM_JOINTS,
         num_classes: int = NUM_CLASSES,
         dropout: float = DROPOUT,
+        env_dim: int = 0,  # 0 = no environment conditioning
     ):
         super().__init__()
+        self.env_dim = env_dim
 
         in_dim = FULL_INPUT_DIM  # joint(51) + bone(48) + velocity(51) = 150
 
@@ -209,14 +233,24 @@ class PoseEventClassifier(nn.Module):
             MultiScaleTemporalBlock(BLOCK_CHANNELS[2], BLOCK_CHANNELS[3], kernels=(3, 7, 15), dropout=dropout),
         ])
 
+        # FiLM conditioning per block (only if env features provided)
+        if env_dim > 0:
+            self.conditioners = nn.ModuleList([
+                EnvironmentConditioner(env_dim, ch)
+                for ch in BLOCK_CHANNELS
+            ])
+        else:
+            self.conditioners = None
+
         self.pool = TemporalAttentionPool(final_channels)
 
         self.fc = nn.Linear(final_channels, num_classes)
 
-    def forward(self, x):
+    def forward(self, x, env_features=None):
         """
         Args:
             x: (batch, seq_len, 51) -- flattened keypoints
+            env_features: optional (batch, env_dim) -- environment context
         Returns:
             logits: (batch, num_classes)
         """
@@ -258,9 +292,13 @@ class PoseEventClassifier(nn.Module):
         x = x.permute(0, 2, 1)  # (B, 150, T)
         x = self.input_bn(x)
 
-        # Temporal blocks
-        for block in self.blocks:
-            x = block(x)  # (B, 256, T')
+        # Temporal blocks with optional FiLM conditioning
+        for i, block in enumerate(self.blocks):
+            x = block(x)  # (B, C, T')
+            if self.conditioners is not None and env_features is not None:
+                gamma, beta = self.conditioners[i](env_features)
+                # Broadcast: gamma/beta are (B, C), x is (B, C, T')
+                x = gamma.unsqueeze(2) * x + beta.unsqueeze(2)
 
         # Temporal attention pooling (learned per-frame importance)
         x = self.pool(x)  # (B, 256)
@@ -417,8 +455,16 @@ def main():
     print(f"Train: {len(train_loader.dataset)} | Val: {len(val_loader.dataset)} | Test: {len(test_loader.dataset)}")
     print()
 
+    # Environment conditioning: check if env features exist alongside pose data
+    env_dim = 0
+    env_features_dir = Path("data/env_features")
+    if env_features_dir.exists():
+        env_dim = 32  # 8 object classes × 4 features each
+        print(f"Environment features found — conditioning with {env_dim}-dim context")
+
     model = PoseEventClassifier(
         dropout=DROPOUT,
+        env_dim=env_dim,
     ).to(DEVICE)
 
     num_params = sum(p.numel() for p in model.parameters())
