@@ -82,9 +82,7 @@ def convert(
         total_frames = ann["total_frames"]
         frame_dir = ann["frame_dir"]
 
-        # Use first person only
-        kp = keypoints[0]    # (T, 17, 2)
-        sc = scores[0]       # (T, 17)
+        n_bodies = keypoints.shape[0]  # M persons in this sample
 
         if total_frames < 10:
             skipped_short += 1
@@ -100,20 +98,30 @@ def convert(
                 class_written[vistarra_class] += 1
                 continue
 
-            # Build frames list
+            # Build frames list — include all bodies
             frames = []
             n_frames = total_frames  # Keep full sequence length
             for t in range(n_frames):
-                kp_frame = []
-                for j in range(17):
-                    x = float(kp[t, j, 0])
-                    y = float(kp[t, j, 1])
-                    c = float(sc[t, j])
-                    kp_frame.append([x, y, c])
-                frames.append({
-                    "keypoints": kp_frame,
+                bodies = []
+                for m in range(n_bodies):
+                    kp_body = []
+                    for j in range(17):
+                        x = float(keypoints[m, t, j, 0])
+                        y = float(keypoints[m, t, j, 1])
+                        c = float(scores[m, t, j])
+                        kp_body.append([x, y, c])
+                    bodies.append(kp_body)
+
+                # Always include "keypoints" (body 0) for prepare.py compat.
+                # For multi-body, also include "bodies" for visualization
+                # and future model extensions.
+                frame_data = {
+                    "keypoints": bodies[0],
                     "timestamp": t / fps,
-                })
+                }
+                if n_bodies > 1:
+                    frame_data["bodies"] = bodies
+                frames.append(frame_data)
 
             output = {
                 "frames": frames,
