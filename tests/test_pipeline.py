@@ -1023,6 +1023,7 @@ class TestCTRGraphBlock:
         x = torch.randn(2, 6, 50, 34)
         block(x).sum().backward()
         assert block.theta.weight.grad.abs().sum() == 0
+        assert block.phi.weight.grad.abs().sum() == 0
 
 
 class TestSTGCNClassifier:
