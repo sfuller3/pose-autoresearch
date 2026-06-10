@@ -879,3 +879,49 @@ class TestDistanceDecay:
         """Neighbor at 2x frame diagonal → essentially zero."""
         decay = torch.sigmoid(torch.tensor(5.0 - 2.0 * 10))
         assert decay.item() < 0.001
+
+
+# ============================================================================
+# CTR-GCN BACKBONE TESTS
+# ============================================================================
+
+
+class TestTwoBodyGraph:
+    """Tests for the 34-joint two-person adjacency (CTR-GCN backbone)."""
+
+    def test_shape_and_dtype(self):
+        from pose_autoresearch.graph import get_two_body_adjacency
+        A = get_two_body_adjacency()
+        assert A.shape == (34, 34)
+        assert A.dtype == np.float32
+
+    def test_symmetric(self):
+        from pose_autoresearch.graph import get_two_body_adjacency
+        A = get_two_body_adjacency()
+        assert np.allclose(A, A.T, atol=1e-6)
+
+    def test_intra_body_edges_present(self):
+        from pose_autoresearch.graph import get_two_body_adjacency
+        A = get_two_body_adjacency()
+        # left_shoulder <-> right_shoulder for both bodies
+        assert A[5, 6] > 0
+        assert A[5 + 17, 6 + 17] > 0
+
+    def test_cross_body_edges_present(self):
+        from pose_autoresearch.graph import get_two_body_adjacency, TWO_BODY_CROSS_EDGES
+        A = get_two_body_adjacency()
+        for i, j in TWO_BODY_CROSS_EDGES:
+            assert A[i, j] > 0, f"cross edge ({i},{j}) missing"
+
+    def test_no_spurious_cross_edges(self):
+        from pose_autoresearch.graph import get_two_body_adjacency
+        A = get_two_body_adjacency()
+        # primary ankle (15) and neighbor ankle (32) are not connected
+        assert A[15, 32] == 0
+
+    def test_normalized(self):
+        from pose_autoresearch.graph import get_two_body_adjacency
+        A = get_two_body_adjacency()
+        # Symmetric normalization keeps values in (0, 1]
+        assert A.max() <= 1.0 + 1e-6
+        assert A.min() >= 0.0

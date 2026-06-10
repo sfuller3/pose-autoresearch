@@ -159,3 +159,32 @@ def _bfs_distance(
     # Unreachable nodes get max distance
     max_d = max(d for d in dist if d >= 0)
     return [d if d >= 0 else max_d + 1 for d in dist]
+
+
+# Cross-body seed edges for the unified two-person graph.
+# Primary joints are 0-16, neighbor joints are 17-33 (COCO index + 17).
+TWO_BODY_CROSS_EDGES = [
+    (11, 11 + NUM_JOINTS), (12, 12 + NUM_JOINTS),   # hip <-> hip
+    (9, 9 + NUM_JOINTS), (10, 10 + NUM_JOINTS),     # wrist <-> wrist
+    (9, 0 + NUM_JOINTS), (10, 0 + NUM_JOINTS),      # primary wrists <-> neighbor nose
+]
+
+
+def get_two_body_adjacency(num_joints: int = NUM_JOINTS) -> np.ndarray:
+    """Symmetric-normalized adjacency for a unified two-person skeleton graph.
+
+    Joints 0..16 are the primary person, 17..33 the neighbor. Intra-body
+    edges duplicate COCO_17_EDGES at a +17 offset; cross-body seed edges
+    connect hips, wrists, and primary-wrist-to-neighbor-head so interaction
+    geometry (aggression, working together) is reachable in one hop. The
+    CTR mechanism refines this base dynamically at runtime.
+
+    Returns:
+        (34, 34) float32, D^{-1/2} (A + I) D^{-1/2} normalized.
+    """
+    edges = list(COCO_17_EDGES)
+    edges += [(i + num_joints, j + num_joints) for i, j in COCO_17_EDGES]
+    edges += TWO_BODY_CROSS_EDGES
+    A = get_adjacency_matrix(edges, num_joints * 2, self_loops=True)
+    D_inv_sqrt = np.diag(1.0 / np.sqrt(np.maximum(A.sum(axis=1), 1e-6)))
+    return (D_inv_sqrt @ A @ D_inv_sqrt).astype(np.float32)
