@@ -347,6 +347,12 @@ class CTRGraphBlock(nn.Module):
     differences, temporal-mean pooled), scaled by a per-group `alpha`
     initialized to zero — so training starts as a plain GCN on the
     skeleton and topology refinement grows in as it helps.
+
+    Note (ReZero-style gating): while alpha == 0, theta/phi receive zero
+    gradient; alpha itself gets a healthy gradient and escapes zero on the
+    first optimizer step, after which the affinity branch unfreezes. The
+    `value` projection is a single shared 1x1 conv — the group structure
+    lives in the per-group adjacency, not in the feature projection.
     """
 
     def __init__(self, in_ch, out_ch, A_base, groups=8, rd_ch=8):

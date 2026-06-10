@@ -1016,3 +1016,11 @@ class TestCTRGraphBlock:
         x = torch.randn(2, 6, 50, 34)
         block(x).sum().backward()
         assert block.alpha.grad is not None
+
+    def test_zero_grad_for_theta_phi_at_identity_start(self):
+        """Documents ReZero-style behavior: theta/phi frozen until alpha moves."""
+        block = self._make_block()
+        x = torch.randn(2, 6, 50, 34)
+        block(x).sum().backward()
+        assert block.theta.weight.grad.abs().sum() == 0
+        assert block.phi.weight.grad.abs().sum() == 0
