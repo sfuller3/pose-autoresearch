@@ -925,3 +925,44 @@ class TestTwoBodyGraph:
         # Symmetric normalization keeps values in (0, 1]
         assert A.max() <= 1.0 + 1e-6
         assert A.min() >= 0.0
+
+
+class TestGraphTemporalBlock:
+    """Multi-scale temporal conv over (B, C, T, V) graph features."""
+
+    def test_output_shape_stride1(self):
+        from train import GraphTemporalBlock
+        block = GraphTemporalBlock(64, stride=1)
+        block.eval()
+        x = torch.randn(2, 64, 150, 34)
+        with torch.no_grad():
+            out = block(x)
+        assert out.shape == (2, 64, 150, 34)
+
+    def test_output_shape_stride2(self):
+        from train import GraphTemporalBlock
+        block = GraphTemporalBlock(64, stride=2)
+        block.eval()
+        x = torch.randn(2, 64, 150, 34)
+        with torch.no_grad():
+            out = block(x)
+        assert out.shape == (2, 64, 75, 34)
+
+    def test_stride2_chains(self):
+        """150 -> 75 -> 38 like the spec's stage layout."""
+        from train import GraphTemporalBlock
+        b1 = GraphTemporalBlock(32, stride=2)
+        b2 = GraphTemporalBlock(32, stride=2)
+        b1.eval(); b2.eval()
+        x = torch.randn(1, 32, 150, 34)
+        with torch.no_grad():
+            out = b2(b1(x))
+        assert out.shape == (1, 32, 38, 34)
+
+    def test_gradient_flow(self):
+        from train import GraphTemporalBlock
+        block = GraphTemporalBlock(32)
+        x = torch.randn(2, 32, 50, 34, requires_grad=True)
+        block(x).sum().backward()
+        assert x.grad is not None
+        assert x.grad.abs().sum() > 0

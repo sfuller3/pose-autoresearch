@@ -271,6 +271,73 @@ class SqueezeExcitation(nn.Module):
         return x * w
 
 
+class SqueezeExcitation2d(nn.Module):
+    """Channel attention for (B, C, T, V) graph feature maps."""
+
+    def __init__(self, channels: int, reduction: int = 4):
+        super().__init__()
+        mid = max(channels // reduction, 8)
+        self.se = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Flatten(),
+            nn.Linear(channels, mid),
+            nn.SiLU(inplace=True),
+            nn.Linear(mid, channels),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, x):
+        # x: (B, C, T, V)
+        w = self.se(x).unsqueeze(2).unsqueeze(3)  # (B, C, 1, 1)
+        return x * w
+
+
+class GraphTemporalBlock(nn.Module):
+    """Multi-scale temporal convolution over graph features (B, C, T, V).
+
+    Same kernels-3/7/15 + SE design as MultiScaleTemporalBlock, but kernels
+    run along T only ((k, 1) Conv2d) so every joint keeps its own temporal
+    stream. Channel count is preserved; stride downsamples T.
+    """
+
+    def __init__(self, channels, kernels=(3, 7, 15), stride=1, dropout=0.3):
+        super().__init__()
+        branch_ch = channels // len(kernels)
+        remainder = channels - branch_ch * len(kernels)
+
+        self.branches = nn.ModuleList()
+        for i, k in enumerate(kernels):
+            ch = branch_ch + (remainder if i == 0 else 0)
+            self.branches.append(nn.Sequential(
+                nn.Conv2d(channels, ch, (k, 1), stride=(stride, 1),
+                          padding=((k - 1) // 2, 0)),
+                nn.BatchNorm2d(ch),
+                nn.SiLU(inplace=True),
+            ))
+
+        self.conv2 = nn.Conv2d(channels, channels, (3, 1), padding=(1, 0))
+        self.bn2 = nn.BatchNorm2d(channels)
+        self.dropout = nn.Dropout(dropout)
+        self.se = SqueezeExcitation2d(channels)
+
+        if stride != 1:
+            self.residual = nn.Sequential(
+                nn.Conv2d(channels, channels, 1, stride=(stride, 1)),
+                nn.BatchNorm2d(channels),
+            )
+        else:
+            self.residual = nn.Identity()
+        self.act = nn.SiLU(inplace=True)
+
+    def forward(self, x):
+        res = self.residual(x)
+        x = torch.cat([branch(x) for branch in self.branches], dim=1)
+        x = self.dropout(x)
+        x = self.bn2(self.conv2(x))
+        x = self.se(x)
+        return self.act(x + res)
+
+
 class TemporalAttentionPool(nn.Module):
     """Learned attention pooling over temporal dimension.
 
