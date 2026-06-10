@@ -1297,6 +1297,7 @@ def main():
     args = parser.parse_args()
     if args.backbone == "gcn" and args.checkpoint == parser.get_default("checkpoint"):
         args.checkpoint = "checkpoints/best_model_gcn.pt"
+        print(f"[backbone=gcn] using default GCN checkpoint: {args.checkpoint}")
     run_pipeline(args)
 
 
