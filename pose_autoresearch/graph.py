@@ -170,7 +170,7 @@ TWO_BODY_CROSS_EDGES = [
 ]
 
 
-def get_two_body_adjacency(num_joints: int = NUM_JOINTS) -> np.ndarray:
+def get_two_body_adjacency() -> np.ndarray:
     """Symmetric-normalized adjacency for a unified two-person skeleton graph.
 
     Joints 0..16 are the primary person, 17..33 the neighbor. Intra-body
@@ -183,8 +183,8 @@ def get_two_body_adjacency(num_joints: int = NUM_JOINTS) -> np.ndarray:
         (34, 34) float32, D^{-1/2} (A + I) D^{-1/2} normalized.
     """
     edges = list(COCO_17_EDGES)
-    edges += [(i + num_joints, j + num_joints) for i, j in COCO_17_EDGES]
+    edges += [(i + NUM_JOINTS, j + NUM_JOINTS) for i, j in COCO_17_EDGES]
     edges += TWO_BODY_CROSS_EDGES
-    A = get_adjacency_matrix(edges, num_joints * 2, self_loops=True)
+    A = get_adjacency_matrix(edges, NUM_JOINTS * 2, self_loops=True)
     D_inv_sqrt = np.diag(1.0 / np.sqrt(np.maximum(A.sum(axis=1), 1e-6)))
     return (D_inv_sqrt @ A @ D_inv_sqrt).astype(np.float32)
