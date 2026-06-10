@@ -338,6 +338,61 @@ class GraphTemporalBlock(nn.Module):
         return self.act(x + res)
 
 
+class CTRGraphBlock(nn.Module):
+    """Channel-wise Topology Refinement graph convolution (CTR-GCN style).
+
+    A fixed, normalized base adjacency is shared by all channel groups.
+    Each of the `groups` channel groups additionally learns a dynamic
+    pairwise affinity from the input features (tanh of pairwise feature
+    differences, temporal-mean pooled), scaled by a per-group `alpha`
+    initialized to zero — so training starts as a plain GCN on the
+    skeleton and topology refinement grows in as it helps.
+    """
+
+    def __init__(self, in_ch, out_ch, A_base, groups=8, rd_ch=8):
+        super().__init__()
+        assert out_ch % groups == 0, "out_ch must be divisible by groups"
+        self.groups = groups
+        self.out_ch = out_ch
+        self.rd_ch = rd_ch
+        self.register_buffer(
+            "A_base", torch.as_tensor(A_base, dtype=torch.float32))
+
+        self.theta = nn.Conv2d(in_ch, rd_ch * groups, 1)
+        self.phi = nn.Conv2d(in_ch, rd_ch * groups, 1)
+        self.value = nn.Conv2d(in_ch, out_ch, 1)
+        self.alpha = nn.Parameter(torch.zeros(groups))
+
+        self.bn = nn.BatchNorm2d(out_ch)
+        if in_ch != out_ch:
+            self.residual = nn.Sequential(
+                nn.Conv2d(in_ch, out_ch, 1),
+                nn.BatchNorm2d(out_ch),
+            )
+        else:
+            self.residual = nn.Identity()
+        self.act = nn.SiLU(inplace=True)
+
+    def forward(self, x):
+        # x: (B, C, T, V)
+        B, _, T, V = x.shape
+        res = self.residual(x)
+
+        # Dynamic per-group affinity from temporal-mean features
+        th = self.theta(x).mean(dim=2).view(B, self.groups, self.rd_ch, V)
+        ph = self.phi(x).mean(dim=2).view(B, self.groups, self.rd_ch, V)
+        diff = th.unsqueeze(-1) - ph.unsqueeze(-2)        # (B, g, rd, V, V)
+        refine = torch.tanh(diff).mean(dim=2)             # (B, g, V, V)
+
+        A = self.A_base.view(1, 1, V, V) \
+            + self.alpha.view(1, -1, 1, 1) * refine        # (B, g, V, V)
+
+        v = self.value(x).view(B, self.groups, self.out_ch // self.groups, T, V)
+        out = torch.einsum("bgctv,bgvw->bgctw", v, A)
+        out = out.reshape(B, self.out_ch, T, V)
+        return self.act(self.bn(out) + res)
+
+
 class TemporalAttentionPool(nn.Module):
     """Learned attention pooling over temporal dimension.
 

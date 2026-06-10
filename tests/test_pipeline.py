@@ -966,3 +966,53 @@ class TestGraphTemporalBlock:
         block(x).sum().backward()
         assert x.grad is not None
         assert x.grad.abs().sum() > 0
+
+
+class TestCTRGraphBlock:
+    """Channel-wise topology refinement spatial unit."""
+
+    def _make_block(self, in_ch=6, out_ch=64):
+        from train import CTRGraphBlock
+        from pose_autoresearch.graph import get_two_body_adjacency
+        return CTRGraphBlock(in_ch, out_ch, get_two_body_adjacency())
+
+    def test_output_shape(self):
+        block = self._make_block()
+        block.eval()
+        x = torch.randn(2, 6, 150, 34)
+        with torch.no_grad():
+            out = block(x)
+        assert out.shape == (2, 64, 150, 34)
+
+    def test_alpha_initialized_to_zero(self):
+        """Identity-start: dynamic refinement begins disabled."""
+        block = self._make_block()
+        assert torch.all(block.alpha == 0)
+
+    def test_identity_start_ignores_affinity_weights(self):
+        """With alpha=0, perturbing theta/phi must not change the output."""
+        block = self._make_block()
+        block.eval()
+        x = torch.randn(2, 6, 50, 34)
+        with torch.no_grad():
+            out_a = block(x)
+            block.theta.weight.add_(1.0)
+            block.phi.weight.add_(-1.0)
+            out_b = block(x)
+        assert torch.allclose(out_a, out_b, atol=1e-5)
+
+    def test_alpha_changes_output_when_nonzero(self):
+        block = self._make_block()
+        block.eval()
+        x = torch.randn(2, 6, 50, 34)
+        with torch.no_grad():
+            out_a = block(x)
+            block.alpha.add_(0.5)
+            out_b = block(x)
+        assert not torch.allclose(out_a, out_b, atol=1e-4)
+
+    def test_gradient_reaches_alpha(self):
+        block = self._make_block()
+        x = torch.randn(2, 6, 50, 34)
+        block(x).sum().backward()
+        assert block.alpha.grad is not None
