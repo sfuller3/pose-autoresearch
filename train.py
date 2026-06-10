@@ -26,6 +26,7 @@ from prepare import (
     NUM_BONES,
 )
 from pose_autoresearch.augment import augment_pose_sequence
+from pose_autoresearch.graph import get_two_body_adjacency
 from collections import Counter
 import json
 import numpy as np
@@ -397,6 +398,97 @@ class CTRGraphBlock(nn.Module):
         out = torch.einsum("bgctv,bgvw->bgctw", v, A)
         out = out.reshape(B, self.out_ch, T, V)
         return self.act(self.bn(out) + res)
+
+
+class STGCNClassifier(nn.Module):
+    """CTR-GCN-style two-body skeleton classifier.
+
+    Input contract matches PoseEventClassifier with n_bodies=2:
+    (B, T, 105) = primary(51) + neighbor(51) + metadata(3), so it is a
+    drop-in alternative backbone for MultiPersonPoseDataset batches.
+    Selected via POSE_BACKBONE=gcn (see main()).
+    """
+
+    STAGE_CHANNELS = (64, 64, 128, 256)
+    STAGE_STRIDES = (1, 1, 2, 2)
+
+    def __init__(self, num_classes: int = NUM_CLASSES,
+                 dropout: float = DROPOUT, env_dim: int = 0):
+        super().__init__()
+        self.env_dim = env_dim
+        A = get_two_body_adjacency()
+
+        in_ch = 6  # x, y, conf for each joint + dist/rel_x/rel_y broadcast
+        self.input_bn = nn.BatchNorm2d(in_ch)
+
+        stages = []
+        prev = in_ch
+        for ch, stride in zip(self.STAGE_CHANNELS, self.STAGE_STRIDES):
+            stages.append(nn.ModuleList([
+                CTRGraphBlock(prev, ch, A),
+                GraphTemporalBlock(ch, stride=stride, dropout=dropout),
+            ]))
+            prev = ch
+        self.stages = nn.ModuleList(stages)
+
+        if env_dim > 0:
+            self.conditioners = nn.ModuleList([
+                EnvironmentConditioner(env_dim, ch)
+                for ch in self.STAGE_CHANNELS
+            ])
+        else:
+            self.conditioners = None
+
+        final_channels = self.STAGE_CHANNELS[-1]
+        self.pool = TemporalAttentionPool(final_channels)
+        self.fc = nn.Linear(final_channels, num_classes)
+
+    @staticmethod
+    def _gate(kps):
+        """Confidence-gate xy coordinates: sigmoid(conf*5 - 2)."""
+        conf = kps[:, :, :, 2:3]
+        gate = torch.sigmoid(conf * 5 - 2)
+        out = kps.clone()
+        out[:, :, :, :2] = kps[:, :, :, :2] * gate
+        return out
+
+    def forward(self, x, env_features=None):
+        """
+        Args:
+            x: (batch, seq_len, 105)
+            env_features: optional (batch, env_dim)
+        Returns:
+            logits: (batch, num_classes)
+        """
+        B, T, _ = x.shape
+        primary = x[:, :, :51].reshape(B, T, NUM_JOINTS, 3)
+        neighbor = x[:, :, 51:102].reshape(B, T, NUM_JOINTS, 3)
+        metadata = x[:, :, 102:105]  # (B, T, 3)
+
+        primary = self._gate(primary)
+        neighbor = self._gate(neighbor)
+
+        # Soft distance decay on neighbor (same curve as the CNN backbone)
+        decay = torch.sigmoid(5 - metadata[:, :, 0:1] * 10)  # (B, T, 1)
+        neighbor = neighbor * decay.unsqueeze(-1)
+
+        joints = torch.cat([primary, neighbor], dim=2)        # (B, T, 34, 3)
+        meta = metadata.unsqueeze(2).expand(-1, -1, joints.shape[2], -1)
+        feats = torch.cat([joints, meta], dim=3)              # (B, T, 34, 6)
+        x = feats.permute(0, 3, 1, 2).contiguous()            # (B, 6, T, 34)
+
+        x = self.input_bn(x)
+        for i, stage in enumerate(self.stages):
+            spatial, temporal = stage[0], stage[1]
+            x = temporal(spatial(x))
+            if self.conditioners is not None and env_features is not None:
+                gamma, beta = self.conditioners[i](env_features)
+                x = gamma.unsqueeze(2).unsqueeze(3) * x \
+                    + beta.unsqueeze(2).unsqueeze(3)
+
+        x = x.mean(dim=3)        # joint pool -> (B, C, T')
+        x = self.pool(x)         # temporal attention -> (B, C)
+        return self.fc(x)
 
 
 class TemporalAttentionPool(nn.Module):

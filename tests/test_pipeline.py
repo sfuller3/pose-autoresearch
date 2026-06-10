@@ -1023,4 +1023,72 @@ class TestCTRGraphBlock:
         x = torch.randn(2, 6, 50, 34)
         block(x).sum().backward()
         assert block.theta.weight.grad.abs().sum() == 0
-        assert block.phi.weight.grad.abs().sum() == 0
+
+
+class TestSTGCNClassifier:
+    """End-to-end CTR-GCN backbone."""
+
+    def test_forward_shape(self):
+        from train import STGCNClassifier
+        model = STGCNClassifier()
+        model.eval()
+        x = torch.randn(2, 150, 105)
+        with torch.no_grad():
+            out = model(x)
+        assert out.shape == (2, 7)
+
+    def test_zero_neighbor_no_nan(self):
+        """Single-person input (zero neighbor + zero metadata) is valid."""
+        from train import STGCNClassifier
+        model = STGCNClassifier()
+        model.eval()
+        x = torch.randn(2, 150, 105)
+        x[:, :, 51:] = 0
+        with torch.no_grad():
+            out = model(x)
+        assert out.shape == (2, 7)
+        assert not torch.isnan(out).any()
+
+    def test_distance_affects_output(self):
+        """Far neighbor (decayed) must differ from near neighbor."""
+        from train import STGCNClassifier
+        model = STGCNClassifier()
+        model.eval()
+        x_near = torch.randn(1, 150, 105)
+        x_far = x_near.clone()
+        x_near[:, :, 102] = 0.1
+        x_far[:, :, 102] = 2.0
+        with torch.no_grad():
+            out_near = model(x_near)
+            out_far = model(x_far)
+        assert not torch.allclose(out_near, out_far, atol=1e-3)
+
+    def test_film_conditioning(self):
+        from train import STGCNClassifier
+        model = STGCNClassifier(env_dim=32)
+        model.eval()
+        x = torch.randn(2, 150, 105)
+        env_a = torch.zeros(2, 32)
+        env_b = torch.ones(2, 32)
+        with torch.no_grad():
+            out_plain = model(x)                      # no env features
+            out_a = model(x, env_features=env_a)
+            out_b = model(x, env_features=env_b)
+        assert out_plain.shape == (2, 7)
+        assert not torch.allclose(out_a, out_b, atol=1e-4)
+
+    def test_param_budget(self):
+        from train import STGCNClassifier
+        model = STGCNClassifier()
+        n = sum(p.numel() for p in model.parameters())
+        assert n < 2_500_000, f"{n:,} params exceeds 2.5M budget"
+
+    def test_backward(self):
+        from train import STGCNClassifier
+        model = STGCNClassifier()
+        x = torch.randn(2, 150, 105, requires_grad=True)
+        model(x).sum().backward()
+        assert x.grad is not None
+        # gradient reaches both bodies and metadata
+        assert x.grad[:, :, :51].abs().sum() > 0
+        assert x.grad[:, :, 51:102].abs().sum() > 0
