@@ -806,7 +806,6 @@ def main():
     print("POSE AUTORESEARCH - Training Run")
     print("=" * 70)
     print(f"Device: {DEVICE}")
-    print(f"Model: Temporal CNN")
     print(f"Batch Size: {BATCH_SIZE}")
     print(f"Learning Rate: {LEARNING_RATE}")
     print(f"Time Budget: {MAX_TIME_BUDGET_SECONDS}s")
