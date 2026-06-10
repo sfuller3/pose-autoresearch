@@ -5,6 +5,7 @@ The agent modifies this file to improve validation accuracy.
 
 from __future__ import annotations
 
+import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -784,6 +785,22 @@ def train_epoch(model, dataloader, optimizer, criterion, scheduler, device,
 # ============================================================================
 
 
+def build_model(backbone, env_dim, n_bodies):
+    """Construct the classifier for the requested backbone.
+
+    Returns (model, checkpoint_path). The GCN saves to a separate
+    checkpoint file so side-by-side comparison never clobbers the CNN.
+    """
+    if backbone == "gcn":
+        model = STGCNClassifier(dropout=DROPOUT, env_dim=env_dim)
+        return model, "checkpoints/best_model_gcn.pt"
+    if backbone == "cnn":
+        model = PoseEventClassifier(
+            dropout=DROPOUT, env_dim=env_dim, n_bodies=n_bodies)
+        return model, "checkpoints/best_model.pt"
+    raise ValueError(f"Unknown POSE_BACKBONE: {backbone!r} (use 'cnn' or 'gcn')")
+
+
 def main():
     print("=" * 70)
     print("POSE AUTORESEARCH - Training Run")
@@ -838,11 +855,14 @@ def main():
         env_dim = 32  # 8 object classes × 4 features each
         print(f"Environment features found — conditioning with {env_dim}-dim context")
 
-    model = PoseEventClassifier(
-        dropout=DROPOUT,
-        env_dim=env_dim,
-        n_bodies=n_bodies,
-    ).to(DEVICE)
+    backbone = os.environ.get("POSE_BACKBONE", "cnn").strip().lower() or "cnn"
+    if backbone == "gcn" and n_bodies != 2:
+        raise SystemExit(
+            "POSE_BACKBONE=gcn requires multi-person data (data/splits/). "
+            "Run scripts/split_data.py first.")
+    model, ckpt_path = build_model(backbone, env_dim, n_bodies)
+    model = model.to(DEVICE)
+    print(f"Backbone: {backbone} -> {ckpt_path}")
 
     num_params = sum(p.numel() for p in model.parameters())
     print(f"Parameters: {num_params:,}")
@@ -909,7 +929,7 @@ def main():
                     "optimizer_state_dict": optimizer.state_dict(),
                     "val_acc": val_acc,
                 },
-                "checkpoints/best_model.pt",
+                ckpt_path,
             )
 
         print(
@@ -925,7 +945,7 @@ def main():
     print("=" * 70)
 
     # Final evaluation
-    ckpt = torch.load("checkpoints/best_model.pt", weights_only=True)
+    ckpt = torch.load(ckpt_path, weights_only=True)
     model.load_state_dict(ckpt["model_state_dict"])
 
     test_acc, test_loss = evaluate_model(model, test_loader, DEVICE)

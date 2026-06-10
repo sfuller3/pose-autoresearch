@@ -1093,3 +1093,22 @@ class TestSTGCNClassifier:
         # gradient reaches both bodies and metadata
         assert x.grad[:, :, :51].abs().sum() > 0
         assert x.grad[:, :, 51:102].abs().sum() > 0
+
+
+class TestBackboneSelection:
+    def test_build_model_cnn_default(self):
+        from train import build_model, PoseEventClassifier
+        model, ckpt_path = build_model("cnn", env_dim=0, n_bodies=2)
+        assert isinstance(model, PoseEventClassifier)
+        assert ckpt_path == "checkpoints/best_model.pt"
+
+    def test_build_model_gcn(self):
+        from train import build_model, STGCNClassifier
+        model, ckpt_path = build_model("gcn", env_dim=0, n_bodies=2)
+        assert isinstance(model, STGCNClassifier)
+        assert ckpt_path == "checkpoints/best_model_gcn.pt"
+
+    def test_build_model_unknown_raises(self):
+        from train import build_model
+        with pytest.raises(ValueError):
+            build_model("transformer", env_dim=0, n_bodies=2)
