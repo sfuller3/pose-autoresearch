@@ -15,6 +15,9 @@ Decisions locked during brainstorming:
 - **Integration:** into `stream_detect.py`, signal chain isolated in `vitals.py`.
 - **Control mechanism:** master enable flag, per-frame people cap, estimation
   cadence throttle, and a signal-quality reporting gate.
+- **Liveness/occupancy signal:** a fused per-person state machine
+  (`EMPTY → PRESENT_STATIC → PRESENT_MOVING → LIVE_CONFIRMED`) combining a
+  keypoint-motion activity metric with rPPG pulse confirmation.
 
 This is additive. With `--vitals` off (the default), the pipeline behaves
 exactly as today — event detection is untouched.
@@ -85,7 +88,10 @@ changes are required and two are improvements:
 - `hr_quality`, `rr_quality`: last quality scores.
 - `last_vitals_frame`: frame index of last estimation (for cadence throttle).
 - `head_motion`: rolling variance of eye-midpoint position over the window
-  (motion gate).
+  (rPPG motion gate; a face-region subset of whole-body activity).
+- `activity_ema`: smoothed whole-body keypoint-motion metric (continuous
+  activity level).
+- `liveness`: a `LivenessMonitor` instance (per-person state + timers).
 
 ### `VitalsController` (the control mechanism)
 
@@ -99,6 +105,9 @@ Config object (constructed from CLI args) with:
   tuned during validation; placeholder 2.0).
 - `motion_max: float` — maximum head-motion variance to report.
 - `abnormal ranges` — HR `[40, 130]`, RR `[8, 25]`; outside → alert.
+- **Liveness params:** `move_threshold`, `move_hold_s` (3 s), `pulse_hold_s`
+  (10 s), `unresponsive_s` (30 s), `unresponsive_alert: bool` (default False,
+  `--vitals-unresponsive-alert`).
 
 `should_estimate(state, frame_idx)` and `should_report(state)` centralize the
 gating so the pipeline loop stays readable.
@@ -120,14 +129,61 @@ Inside the existing per-active-person loop, when `controller.enabled`:
 People beyond `max_people` still track and classify events; they just skip the
 rPPG compute that frame.
 
+### Liveness & activity signal (fused state machine)
+
+A per-person signal answering "is a live person present, and are they active?"
+It fuses an instant keypoint-motion read with the slower rPPG pulse confirmation,
+so it degrades gracefully: movement-based occupancy works even when the face is
+not visible or `--vitals` cannot confirm a pulse, and pulse upgrades it to
+physiological confirmation (anti-spoof: a photo/mannequin never reaches
+`LIVE_CONFIRMED`).
+
+**`ActivityEstimator` (`vitals.py`, stateless helper)**
+- `frame_activity(prev_kps, cur_kps) -> float`: mean over confident joints of
+  `||p_t - p_{t-1}||`, normalized by a body-scale reference (shoulder width, or
+  bbox diagonal fallback) so the metric is invariant to distance from the camera.
+- The pipeline maintains a per-person `activity_ema` (EMA alpha default 0.3) over
+  this metric — the continuous "activity level" shown on the HUD/log.
+
+**`LivenessMonitor` (`vitals.py`, per-person instance in `PersonState`)**
+Holds `last_move_time`, `last_pulse_time`, and the current state. `update(now,
+is_tracked, activity, pulse_quality) -> LivenessState` applies, strongest
+evidence first:
+- `LIVE_CONFIRMED` — a valid pulse (`pulse_quality >= quality_min`) was seen
+  within `pulse_hold_s` (default 10 s). Pulse latches over brief stillness.
+- `PRESENT_MOVING` — no recent pulse, but `activity > move_threshold` within
+  `move_hold_s` (default 3 s).
+- `PRESENT_STATIC` — tracked, but neither recent pulse nor recent movement.
+- `EMPTY` — no active track (grace period expired).
+
+`states` is an `enum.IntEnum` so ordering ("highest achieved") is explicit.
+
+**Unresponsiveness branch (opt-in):** a track held in `PRESENT_STATIC`
+continuously for `unresponsive_s` (default 30 s) with no pulse raises a
+"possible unresponsiveness" alert via `AlertDispatcher`. Default **off**
+(`--vitals-unresponsive-alert`) because a still, face-occluded sleeping resident
+can sit in `PRESENT_STATIC` legitimately; thresholds need site tuning before this
+is trusted. The liveness *state* is always produced; only the *alert* is gated.
+
+**Pipeline:** after the rPPG step in the per-person loop, compute
+`frame_activity` from the keypoint buffer, update `activity_ema`, then
+`state.liveness.update(...)`. Runs whenever the track is active — independent of
+the `max_people` rPPG cap (activity is cheap), so every tracked person always has
+at least a movement-based liveness state; only `LIVE_CONFIRMED` needs rPPG.
+
 ### Output
 
 - **HUD:** per person, `HR 72 / RR 16` near the head, colored by quality
-  (gray = acquiring, green = confident). Reuses the existing overlay drawing.
+  (gray = acquiring, green = confident), plus a liveness badge (state name +
+  color: EMPTY gray, STATIC amber, MOVING blue, LIVE green) and an activity bar.
+  Reuses the existing overlay drawing.
 - **Log:** `events/vitals_log.jsonl`, one record per report:
-  `{track_id, timestamp, hr_bpm, rr_bpm, hr_quality, rr_quality}`.
+  `{track_id, timestamp, hr_bpm, rr_bpm, hr_quality, rr_quality, liveness,
+  activity}`. Liveness state *changes* also emit a record so occupancy
+  transitions are logged even when no vitals are reported.
 - **Alerts:** abnormal HR/RR reuse `AlertDispatcher` (console + webhook), tagged
-  with track_id, mirroring the event-alert path.
+  with track_id, mirroring the event-alert path. Opt-in unresponsiveness alert
+  (prolonged `PRESENT_STATIC` + no pulse) uses the same dispatcher.
 - **CSV recorder** (validation aid): optional `--vitals-csv path` dumps
   `(timestamp, track_id, hr, rr, quality)` for offline comparison against a
   pulse-oximeter reference.
@@ -144,6 +200,12 @@ Unit (`tests/test_pipeline.py` additions):
   flanking nose; rolled keypoints → boxes rotate; low-confidence/profile → `None`.
 - **Controller:** `max_people` cap selects largest faces; `cadence` throttles
   estimation; abnormal ranges flag correctly.
+- **Activity metric:** moving synthetic keypoints → high activity, static → ~0;
+  same motion at two bbox scales → similar normalized activity (scale invariance).
+- **Liveness state machine:** scripted input sequences drive
+  `EMPTY→PRESENT_STATIC→PRESENT_MOVING→LIVE_CONFIRMED` and back; pulse latch holds
+  `LIVE_CONFIRMED` over brief stillness for `pulse_hold_s`; unresponsiveness timer
+  fires only after `unresponsive_s` of continuous `PRESENT_STATIC` with no pulse.
 
 Integration:
 - Synthetic frames with a sinusoidally brightening face ROI through the full
@@ -159,9 +221,9 @@ neighborhood: HR MAE < 5 bpm at rest, good face visibility.
 
 | File | Change |
 |------|--------|
-| `vitals.py` | New: `FaceROIExtractor`, `RPPGEstimator`, `VitalsController` |
-| `stream_detect.py` | `PersonState` fields; per-person rPPG in `run_pipeline`; HUD; vitals log; CLI flags |
-| `tests/test_pipeline.py` | New `TestFaceROIExtractor`, `TestRPPGEstimator`, `TestVitalsController` |
+| `vitals.py` | New: `FaceROIExtractor`, `RPPGEstimator`, `ActivityEstimator`, `LivenessMonitor`, `LivenessState`, `VitalsController` |
+| `stream_detect.py` | `PersonState` fields; per-person rPPG + liveness in `run_pipeline`; HUD; vitals log; CLI flags |
+| `tests/test_pipeline.py` | New `TestFaceROIExtractor`, `TestRPPGEstimator`, `TestActivityEstimator`, `TestLivenessMonitor`, `TestVitalsController` |
 | `prepare.py` | No changes (immutable) |
 
 ## Risks / open items
