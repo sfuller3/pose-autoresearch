@@ -17,7 +17,10 @@ Decisions locked during brainstorming:
   cadence throttle, and a signal-quality reporting gate.
 - **Liveness/occupancy signal:** a fused per-person state machine
   (`EMPTY → PRESENT_STATIC → PRESENT_MOVING → LIVE_CONFIRMED`) combining a
-  keypoint-motion activity metric with rPPG pulse confirmation.
+  keypoint-motion activity metric with rPPG pulse confirmation. This *enhances*
+  the existing coarse presence signal (a `PersonTracker` track = "body detected")
+  with activity gradation and anti-spoof, and can optionally harden the event
+  detector against static photos/posters — it is not a parallel mechanism.
 
 This is additive. With `--vitals` off (the default), the pipeline behaves
 exactly as today — event detection is untouched.
@@ -108,6 +111,9 @@ Config object (constructed from CLI args) with:
 - **Liveness params:** `move_threshold`, `move_hold_s` (3 s), `pulse_hold_s`
   (10 s), `unresponsive_s` (30 s), `unresponsive_alert: bool` (default False,
   `--vitals-unresponsive-alert`).
+- `live_gating: bool` — when set (`--live-gating`), `apply_context_rules`
+  receives a liveness-derived "live person present" instead of raw body
+  detection. Default False (event path unchanged).
 
 `should_estimate(state, frame_idx)` and `should_report(state)` centralize the
 gating so the pipeline loop stays readable.
@@ -137,6 +143,25 @@ so it degrades gracefully: movement-based occupancy works even when the face is
 not visible or `--vitals` cannot confirm a pulse, and pulse upgrades it to
 physiological confirmation (anti-spoof: a photo/mannequin never reaches
 `LIVE_CONFIRMED`).
+
+**Relationship to existing presence detection.** The pipeline already has a
+coarse presence signal: a `PersonTracker` track existing (`get_active_people` /
+the `people` dict) means "a body was detected," and `person_detected` in
+`apply_context_rules` gates fall/aggression on it. That signal only answers "did
+YOLO detect a human shape" — it cannot distinguish a live person from a photo,
+poster, mannequin, or a person on a TV, and it has no activity gradation. The
+liveness state machine *consumes* that existing presence rather than re-detecting:
+`is_tracked` (the bottom rung, `EMPTY` vs `PRESENT_*`) comes straight from the
+tracker, and activity + pulse are the new rungs layered above it. This is an
+accuracy enhancement of an existing feature, not a parallel mechanism.
+
+**Optional event-detector hardening.** `apply_context_rules` currently takes a
+boolean `person_detected`. With liveness available, the caller can pass
+`liveness >= PRESENT_MOVING` (or `LIVE_CONFIRMED` when rPPG is on) instead of raw
+body detection, so a static photo/poster on the wall no longer suppresses or
+triggers events. This is gated behind `--vitals` (liveness must be running) and
+behind a `--live-gating` flag so the default event path is unchanged; it is a
+small, isolated change at the existing call site, not a rework of the rules.
 
 **`ActivityEstimator` (`vitals.py`, stateless helper)**
 - `frame_activity(prev_kps, cur_kps) -> float`: mean over confident joints of
@@ -206,6 +231,10 @@ Unit (`tests/test_pipeline.py` additions):
   `EMPTY→PRESENT_STATIC→PRESENT_MOVING→LIVE_CONFIRMED` and back; pulse latch holds
   `LIVE_CONFIRMED` over brief stillness for `pulse_hold_s`; unresponsiveness timer
   fires only after `unresponsive_s` of continuous `PRESENT_STATIC` with no pulse.
+- **Live-gating:** with `live_gating` on, a `PRESENT_STATIC` (photo-like, no
+  motion/pulse) track yields "not a live person" to `apply_context_rules`, while a
+  `PRESENT_MOVING`/`LIVE_CONFIRMED` track yields "live"; with `live_gating` off,
+  the boolean passed is the unchanged raw body-detection value.
 
 Integration:
 - Synthetic frames with a sinusoidally brightening face ROI through the full
@@ -222,7 +251,7 @@ neighborhood: HR MAE < 5 bpm at rest, good face visibility.
 | File | Change |
 |------|--------|
 | `vitals.py` | New: `FaceROIExtractor`, `RPPGEstimator`, `ActivityEstimator`, `LivenessMonitor`, `LivenessState`, `VitalsController` |
-| `stream_detect.py` | `PersonState` fields; per-person rPPG + liveness in `run_pipeline`; HUD; vitals log; CLI flags |
+| `stream_detect.py` | `PersonState` fields; per-person rPPG + liveness in `run_pipeline`; HUD; vitals log; CLI flags; optional `--live-gating` at the existing `apply_context_rules` call site |
 | `tests/test_pipeline.py` | New `TestFaceROIExtractor`, `TestRPPGEstimator`, `TestActivityEstimator`, `TestLivenessMonitor`, `TestVitalsController` |
 | `prepare.py` | No changes (immutable) |
 
