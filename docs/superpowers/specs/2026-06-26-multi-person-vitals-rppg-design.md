@@ -1,5 +1,11 @@
 # Multi-Person Contactless Vital Signs (rPPG)
 
+> **SUPERSEDED (2026-06-28):** The implementable design now lives in the Vistarra
+> repo: `Vistarra/docs/superpowers/specs/2026-06-28-contactless-vitals-design.md`,
+> which targets Vistarra's edge/cloud architecture. This document captures the
+> original signal-chain design and reasoning; consult it for rationale, but build
+> from the Vistarra spec.
+
 ## Overview
 
 Add contactless pulse rate (HR) and respiration rate (RR) estimation for every

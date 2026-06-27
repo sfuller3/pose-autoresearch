@@ -1,5 +1,10 @@
 # Edge/Cloud Infrastructure Implementation Plan (Plan 2 of 2)
 
+> **SUPERSEDED / RETIRED (2026-06-28):** Vistarra already provides this
+> infrastructure — `edge/src/upload/event_queue.py` (SQLite store-and-forward),
+> `upload_worker.py`, and `cloud_client.py`. Do not build `edge_sync.py`. Reuse
+> Vistarra's. See `Vistarra/docs/superpowers/specs/2026-06-28-contactless-vitals-design.md`.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Make alert/event delivery resilient: a durable store-and-forward queue so the data record survives a cloud outage, a pluggable alert-sink architecture, a LAN life-safety alarm sink for critical events, and an edge self-health heartbeat — all preserving the rule that the edge never serves data to workers/families directly.

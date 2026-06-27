@@ -1,5 +1,11 @@
 # Vitals Signal Chain + Liveness Implementation Plan (Plan 1 of 2)
 
+> **SUPERSEDED (2026-06-28):** Replaced by the Vistarra-targeted design at
+> `Vistarra/docs/superpowers/specs/2026-06-28-contactless-vitals-design.md`. This
+> standalone plan predated the Vistarra architecture review. The `vitals.py` DSP
+> here is portable, but integration moves to Vistarra's `edge/` (BaseDetector,
+> EventEnvelope, EventQueue/UploadWorker, dual-stream). Do not execute as-is.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** On-device contactless HR/RR (rPPG) and a fused liveness/occupancy signal for every tracked person, integrated into `stream_detect.py`, all runnable and testable without any network.
