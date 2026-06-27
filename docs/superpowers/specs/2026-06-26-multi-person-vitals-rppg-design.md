@@ -23,8 +23,9 @@ Decisions locked during brainstorming:
   detector against static photos/posters — it is not a parallel mechanism.
 - **Deployment topology:** all processing is edge-local; the edge is push-only to
   the cloud and never serves UIs directly. Cloud-down resilience is store-and-
-  forward for the data record, with a proposed local life-safety alert fallback
-  for critical events (see "Edge ↔ cloud topology & offline operation").
+  forward for the data record, plus a local (LAN) life-safety alarm fallback for
+  critical events when the cloud is unreachable (see "Edge ↔ cloud topology &
+  offline operation").
 
 This is additive. With `--vitals` off (the default), the pipeline behaves
 exactly as today — event detection is untouched.
@@ -323,15 +324,22 @@ references (clips uploaded only on escalation). Cloud → consumers (web/app).
   safety events retained at the highest priority.
 - **Edge self-health heartbeat:** the edge periodically reports its own liveness
   to the cloud so a unit going offline is detectable and surfaced to staff.
-- **Local life-safety fallback (PROPOSED — pending confirmation):** for *critical*
-  events only (fall, prolonged unresponsiveness, severe abnormal vitals), the edge
-  raises a one-way alarm over the **local network** to the facility's own on-prem
-  infrastructure (nurse-call relay / LAN alert appliance / optional cellular SMS),
-  independent of the cloud. This is an alarm *to facility systems*, not a
-  data-serving UI, so it preserves "the edge never serves workers/families
-  directly" while ensuring life-safety alerts survive a cloud outage. Existing
-  `AlertDispatcher` (console + webhook) is the natural seam — a LAN/webhook target
-  on the local network is the minimal implementation.
+- **Local life-safety fallback (DECIDED):** for *critical* events only (fall,
+  prolonged unresponsiveness, severe abnormal vitals), the edge raises a one-way
+  alarm over the **local network** to the facility's own on-prem infrastructure
+  (nurse-call relay / LAN alert appliance / optional cellular SMS), independent of
+  the cloud. This is an alarm *to facility systems*, not a data-serving UI, so it
+  preserves "the edge never serves workers/families directly" while ensuring
+  life-safety alerts survive a cloud outage. Cellular/secondary-WAN escalation to
+  the cloud is explicitly out of scope for this version (future option).
+  - **Seam:** the existing `AlertDispatcher` (console + webhook) generalizes to a
+    pluggable sink list. A `LANAlarmSink` (HTTP/webhook to a configured on-prem
+    endpoint, e.g. `--lan-alarm-url`) is added alongside the cloud sink. Critical
+    events fan out to all configured sinks; the LAN sink fires regardless of cloud
+    reachability, the cloud sink rides the store-and-forward queue.
+  - **Severity tiering:** only events classified *critical* reach the LAN alarm;
+    routine vitals/occupancy never do. The abnormal-vitals ranges and the
+    unresponsiveness branch already defined above are the critical triggers.
 
 ## Testing
 
@@ -358,6 +366,9 @@ Unit (`tests/test_pipeline.py` additions):
   `EMPTY→PRESENT_STATIC→PRESENT_MOVING→LIVE_CONFIRMED` and back; pulse latch holds
   `LIVE_CONFIRMED` over brief stillness for `pulse_hold_s`; unresponsiveness timer
   fires only after `unresponsive_s` of continuous `PRESENT_STATIC` with no pulse.
+- **Alert sinks & severity:** a critical event fans out to all configured sinks;
+  `LANAlarmSink` fires even when the cloud sink is unreachable; routine
+  vitals/occupancy events never reach the LAN alarm (severity tiering).
 - **Live-gating:** with `live_gating` on, a `PRESENT_STATIC` (photo-like, no
   motion/pulse) track yields "not a live person" to `apply_context_rules`, while a
   `PRESENT_MOVING`/`LIVE_CONFIRMED` track yields "live"; with `live_gating` off,
@@ -378,7 +389,7 @@ neighborhood: HR MAE < 5 bpm at rest, good face visibility.
 | File | Change |
 |------|--------|
 | `vitals.py` | New: `FaceROIExtractor`, `RPPGEstimator`, `ActivityEstimator`, `LivenessMonitor`, `LivenessState`, `VitalsController`, `detect_regime` / regime enum |
-| `stream_detect.py` | `PersonState` fields; per-person rPPG + liveness in `run_pipeline`; HUD; vitals log; CLI flags; optional `--live-gating` at the existing `apply_context_rules` call site |
+| `stream_detect.py` | `PersonState` fields; per-person rPPG + liveness in `run_pipeline`; HUD; vitals log; CLI flags; optional `--live-gating`; `AlertDispatcher` → pluggable sink list with a `LANAlarmSink` for critical events (`--lan-alarm-url`) |
 | `tests/test_pipeline.py` | New `TestFaceROIExtractor`, `TestRPPGEstimator`, `TestActivityEstimator`, `TestLivenessMonitor`, `TestVitalsController` |
 | `prepare.py` | No changes (immutable) |
 
