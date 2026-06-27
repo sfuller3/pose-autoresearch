@@ -341,6 +341,41 @@ references (clips uploaded only on escalation). Cloud → consumers (web/app).
     routine vitals/occupancy never do. The abnormal-vitals ranges and the
     unresponsiveness branch already defined above are the critical triggers.
 
+## Vistarra coordination (revision required before implementation)
+
+This repo (`pose-autoresearch`) is the model-research arm of the **Vistarra**
+monorepo (consolidates `memryx-fall-demo` + `pose-autoresearch`). A 2026-06-28
+review of the Vistarra repo found this spec's standalone assumptions must be
+reconciled with Vistarra's existing edge/cloud architecture:
+
+- **Event contract:** emit Vistarra's `EdgeEvent`/`EventEnvelope`
+  (`edge/src/detection/events.py`, `envelope.py`) — `event_type` (EventType
+  enum), `urgency` (EventUrgency: immediate/alert/log_only), `camera_id`,
+  `facility_id`, etc. Do NOT use the ad-hoc `{"class"/"event"}` dicts sketched in
+  these plans. Vitals need NEW EventTypes (e.g. `VITALS_READING`,
+  `ABNORMAL_VITALS`) added to that enum + matching detail models.
+- **Severity → urgency:** drop the invented `Severity` enum; reuse `EventUrgency`.
+  Its documented routing already is the hybrid we want: immediate/alert → cloud
+  VLM (Claude Vision), log_only → edge only.
+- **Cloud delivery:** reuse `edge/src/upload/cloud_client.py`
+  (`submit_envelope` → `POST /api/analyze`, `UploadWorker` store-and-forward,
+  `/api/health`). **Plan 2 (`edge_sync.py`) is largely redundant with this and
+  should be dropped/retargeted to thin glue, not a parallel stack.**
+- **Claude Vision retained (hybrid):** the edge trained model does fast
+  first-pass; the cloud VLM remains the confirmation for high-stakes events —
+  specifically fall (`FALL`), unstable gait (`GAIT_ANOMALY`), and getting out of
+  bed (`BED_EXIT_PREDICTED`). This is existing urgency→VLM routing, not new work.
+- **Liveness overlap:** `inactivity_detector` and `nighttime_detector` already
+  track movement/`max_keypoint_displacement_px`/`consecutive_checks_missed`.
+  Integrate the liveness/activity signal with those rather than re-implementing;
+  the rPPG `LIVE_CONFIRMED` rung is the genuinely new contribution.
+- **Edge hardware:** MemryX MX3 (ONNX→MX3 export, `edge/models/mx3_*.py`), not
+  Jetson/TensorRT. Axelera/DeepX are alternate backends.
+
+Plan 1 (signal chain `vitals.py`) is mostly net-new and survives revision; its
+`stream_detect.py` integration points become Vistarra `edge/` integration points
+and its alert emission must build `EdgeEvent`s routed via `cloud_client`.
+
 ## Testing
 
 Unit (`tests/test_pipeline.py` additions):
