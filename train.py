@@ -5,6 +5,7 @@ The agent modifies this file to improve validation accuracy.
 
 from __future__ import annotations
 
+import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -26,6 +27,7 @@ from prepare import (
     NUM_BONES,
 )
 from pose_autoresearch.augment import augment_pose_sequence
+from pose_autoresearch.graph import get_two_body_adjacency
 from collections import Counter
 import json
 import numpy as np
@@ -269,6 +271,225 @@ class SqueezeExcitation(nn.Module):
         # x: (B, C, T)
         w = self.se(x).unsqueeze(2)  # (B, C, 1)
         return x * w
+
+
+class SqueezeExcitation2d(nn.Module):
+    """Channel attention for (B, C, T, V) graph feature maps."""
+
+    def __init__(self, channels: int, reduction: int = 4):
+        super().__init__()
+        mid = max(channels // reduction, 8)
+        self.se = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Flatten(),
+            nn.Linear(channels, mid),
+            nn.SiLU(inplace=True),
+            nn.Linear(mid, channels),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, x):
+        # x: (B, C, T, V)
+        w = self.se(x).unsqueeze(2).unsqueeze(3)  # (B, C, 1, 1)
+        return x * w
+
+
+class GraphTemporalBlock(nn.Module):
+    """Multi-scale temporal convolution over graph features (B, C, T, V).
+
+    Same kernels-3/7/15 + SE design as MultiScaleTemporalBlock, but kernels
+    run along T only ((k, 1) Conv2d) so every joint keeps its own temporal
+    stream. Channel count is preserved; stride downsamples T.
+    """
+
+    def __init__(self, channels, kernels=(3, 7, 15), stride=1, dropout=0.3):
+        super().__init__()
+        branch_ch = channels // len(kernels)
+        remainder = channels - branch_ch * len(kernels)
+
+        self.branches = nn.ModuleList()
+        for i, k in enumerate(kernels):
+            ch = branch_ch + (remainder if i == 0 else 0)
+            self.branches.append(nn.Sequential(
+                nn.Conv2d(channels, ch, (k, 1), stride=(stride, 1),
+                          padding=((k - 1) // 2, 0)),
+                nn.BatchNorm2d(ch),
+                nn.SiLU(inplace=True),
+            ))
+
+        self.conv2 = nn.Conv2d(channels, channels, (3, 1), padding=(1, 0))
+        self.bn2 = nn.BatchNorm2d(channels)
+        self.dropout = nn.Dropout(dropout)
+        self.se = SqueezeExcitation2d(channels)
+
+        if stride != 1:
+            self.residual = nn.Sequential(
+                nn.Conv2d(channels, channels, 1, stride=(stride, 1)),
+                nn.BatchNorm2d(channels),
+            )
+        else:
+            self.residual = nn.Identity()
+        self.act = nn.SiLU(inplace=True)
+
+    def forward(self, x):
+        res = self.residual(x)
+        x = torch.cat([branch(x) for branch in self.branches], dim=1)
+        x = self.dropout(x)
+        x = self.bn2(self.conv2(x))
+        x = self.se(x)
+        return self.act(x + res)
+
+
+class CTRGraphBlock(nn.Module):
+    """Channel-wise Topology Refinement graph convolution (CTR-GCN style).
+
+    A fixed, normalized base adjacency is shared by all channel groups.
+    Each of the `groups` channel groups additionally learns a dynamic
+    pairwise affinity from the input features (tanh of pairwise feature
+    differences, temporal-mean pooled), scaled by a per-group `alpha`
+    initialized to zero — so training starts as a plain GCN on the
+    skeleton and topology refinement grows in as it helps.
+
+    Note (ReZero-style gating): while alpha == 0, theta/phi receive zero
+    gradient; alpha itself gets a healthy gradient and escapes zero on the
+    first optimizer step, after which the affinity branch unfreezes. The
+    `value` projection is a single shared 1x1 conv — the group structure
+    lives in the per-group adjacency, not in the feature projection.
+    """
+
+    def __init__(self, in_ch, out_ch, A_base, groups=8, rd_ch=8):
+        super().__init__()
+        assert out_ch % groups == 0, "out_ch must be divisible by groups"
+        self.groups = groups
+        self.out_ch = out_ch
+        self.rd_ch = rd_ch
+        self.register_buffer(
+            "A_base", torch.as_tensor(A_base, dtype=torch.float32))
+
+        self.theta = nn.Conv2d(in_ch, rd_ch * groups, 1)
+        self.phi = nn.Conv2d(in_ch, rd_ch * groups, 1)
+        self.value = nn.Conv2d(in_ch, out_ch, 1)
+        self.alpha = nn.Parameter(torch.zeros(groups))
+
+        self.bn = nn.BatchNorm2d(out_ch)
+        if in_ch != out_ch:
+            self.residual = nn.Sequential(
+                nn.Conv2d(in_ch, out_ch, 1),
+                nn.BatchNorm2d(out_ch),
+            )
+        else:
+            self.residual = nn.Identity()
+        self.act = nn.SiLU(inplace=True)
+
+    def forward(self, x):
+        # x: (B, C, T, V)
+        B, _, T, V = x.shape
+        res = self.residual(x)
+
+        # Dynamic per-group affinity from temporal-mean features
+        th = self.theta(x).mean(dim=2).view(B, self.groups, self.rd_ch, V)
+        ph = self.phi(x).mean(dim=2).view(B, self.groups, self.rd_ch, V)
+        diff = th.unsqueeze(-1) - ph.unsqueeze(-2)        # (B, g, rd, V, V)
+        refine = torch.tanh(diff).mean(dim=2)             # (B, g, V, V)
+
+        A = self.A_base.view(1, 1, V, V) \
+            + self.alpha.view(1, -1, 1, 1) * refine        # (B, g, V, V)
+
+        v = self.value(x).view(B, self.groups, self.out_ch // self.groups, T, V)
+        out = torch.einsum("bgctv,bgvw->bgctw", v, A)
+        out = out.reshape(B, self.out_ch, T, V)
+        return self.act(self.bn(out) + res)
+
+
+class STGCNClassifier(nn.Module):
+    """CTR-GCN-style two-body skeleton classifier.
+
+    Input contract matches PoseEventClassifier with n_bodies=2:
+    (B, T, 105) = primary(51) + neighbor(51) + metadata(3), so it is a
+    drop-in alternative backbone for MultiPersonPoseDataset batches.
+    Selected via POSE_BACKBONE=gcn (see main()).
+    """
+
+    STAGE_CHANNELS = (64, 64, 128, 256)
+    STAGE_STRIDES = (1, 1, 2, 2)
+
+    def __init__(self, num_classes: int = NUM_CLASSES,
+                 dropout: float = DROPOUT, env_dim: int = 0):
+        super().__init__()
+        self.env_dim = env_dim
+        A = get_two_body_adjacency()
+
+        in_ch = 6  # x, y, conf for each joint + dist/rel_x/rel_y broadcast
+        self.input_bn = nn.BatchNorm2d(in_ch)
+
+        stages = []
+        prev = in_ch
+        for ch, stride in zip(self.STAGE_CHANNELS, self.STAGE_STRIDES):
+            stages.append(nn.ModuleList([
+                CTRGraphBlock(prev, ch, A),
+                GraphTemporalBlock(ch, stride=stride, dropout=dropout),
+            ]))
+            prev = ch
+        self.stages = nn.ModuleList(stages)
+
+        if env_dim > 0:
+            self.conditioners = nn.ModuleList([
+                EnvironmentConditioner(env_dim, ch)
+                for ch in self.STAGE_CHANNELS
+            ])
+        else:
+            self.conditioners = None
+
+        final_channels = self.STAGE_CHANNELS[-1]
+        self.pool = TemporalAttentionPool(final_channels)
+        self.fc = nn.Linear(final_channels, num_classes)
+
+    @staticmethod
+    def _gate(kps):
+        """Confidence-gate xy coordinates: sigmoid(conf*5 - 2)."""
+        conf = kps[:, :, :, 2:3]
+        gate = torch.sigmoid(conf * 5 - 2)
+        out = kps.clone()
+        out[:, :, :, :2] = kps[:, :, :, :2] * gate
+        return out
+
+    def forward(self, x, env_features=None):
+        """
+        Args:
+            x: (batch, seq_len, 105)
+            env_features: optional (batch, env_dim)
+        Returns:
+            logits: (batch, num_classes)
+        """
+        B, T, _ = x.shape
+        primary = x[:, :, :51].reshape(B, T, NUM_JOINTS, 3)
+        neighbor = x[:, :, 51:102].reshape(B, T, NUM_JOINTS, 3)
+        metadata = x[:, :, 102:105]  # (B, T, 3)
+
+        primary = self._gate(primary)
+        neighbor = self._gate(neighbor)
+
+        # Soft distance decay on neighbor (same curve as the CNN backbone)
+        decay = torch.sigmoid(5 - metadata[:, :, 0:1] * 10)  # (B, T, 1)
+        neighbor = neighbor * decay.unsqueeze(-1)
+
+        joints = torch.cat([primary, neighbor], dim=2)        # (B, T, 34, 3)
+        meta = metadata.unsqueeze(2).expand(-1, -1, joints.shape[2], -1)
+        feats = torch.cat([joints, meta], dim=3)              # (B, T, 34, 6)
+        x = feats.permute(0, 3, 1, 2).contiguous()            # (B, 6, T, 34)
+
+        x = self.input_bn(x)
+        for i, stage in enumerate(self.stages):
+            spatial, temporal = stage[0], stage[1]
+            x = temporal(spatial(x))
+            if self.conditioners is not None and env_features is not None:
+                gamma, beta = self.conditioners[i](env_features)
+                x = gamma.unsqueeze(2).unsqueeze(3) * x \
+                    + beta.unsqueeze(2).unsqueeze(3)
+
+        x = x.mean(dim=3)        # joint pool -> (B, C, T')
+        x = self.pool(x)         # temporal attention -> (B, C)
+        return self.fc(x)
 
 
 class TemporalAttentionPool(nn.Module):
@@ -564,12 +785,27 @@ def train_epoch(model, dataloader, optimizer, criterion, scheduler, device,
 # ============================================================================
 
 
+def build_model(backbone, env_dim, n_bodies):
+    """Construct the classifier for the requested backbone.
+
+    Returns (model, checkpoint_path). The GCN saves to a separate
+    checkpoint file so side-by-side comparison never clobbers the CNN.
+    """
+    if backbone == "gcn":
+        model = STGCNClassifier(dropout=DROPOUT, env_dim=env_dim)
+        return model, "checkpoints/best_model_gcn.pt"
+    if backbone == "cnn":
+        model = PoseEventClassifier(
+            dropout=DROPOUT, env_dim=env_dim, n_bodies=n_bodies)
+        return model, "checkpoints/best_model.pt"
+    raise ValueError(f"Unknown POSE_BACKBONE: {backbone!r} (use 'cnn' or 'gcn')")
+
+
 def main():
     print("=" * 70)
     print("POSE AUTORESEARCH - Training Run")
     print("=" * 70)
     print(f"Device: {DEVICE}")
-    print(f"Model: Temporal CNN")
     print(f"Batch Size: {BATCH_SIZE}")
     print(f"Learning Rate: {LEARNING_RATE}")
     print(f"Time Budget: {MAX_TIME_BUDGET_SECONDS}s")
@@ -618,11 +854,14 @@ def main():
         env_dim = 32  # 8 object classes × 4 features each
         print(f"Environment features found — conditioning with {env_dim}-dim context")
 
-    model = PoseEventClassifier(
-        dropout=DROPOUT,
-        env_dim=env_dim,
-        n_bodies=n_bodies,
-    ).to(DEVICE)
+    backbone = os.environ.get("POSE_BACKBONE", "cnn").strip().lower() or "cnn"
+    if backbone == "gcn" and n_bodies != 2:
+        raise SystemExit(
+            "POSE_BACKBONE=gcn requires multi-person data (data/splits/). "
+            "Run scripts/split_data.py first.")
+    model, ckpt_path = build_model(backbone, env_dim, n_bodies)
+    model = model.to(DEVICE)
+    print(f"Backbone: {backbone} -> {ckpt_path}")
 
     num_params = sum(p.numel() for p in model.parameters())
     print(f"Parameters: {num_params:,}")
@@ -689,7 +928,7 @@ def main():
                     "optimizer_state_dict": optimizer.state_dict(),
                     "val_acc": val_acc,
                 },
-                "checkpoints/best_model.pt",
+                ckpt_path,
             )
 
         print(
@@ -705,7 +944,7 @@ def main():
     print("=" * 70)
 
     # Final evaluation
-    ckpt = torch.load("checkpoints/best_model.pt", weights_only=True)
+    ckpt = torch.load(ckpt_path, weights_only=True)
     model.load_state_dict(ckpt["model_state_dict"])
 
     test_acc, test_loss = evaluate_model(model, test_loader, DEVICE)

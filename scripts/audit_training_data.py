@@ -226,14 +226,15 @@ def _render_static_strip(frames, label, name, out_path):
     plt.close(fig)
 
 
-def plot_confusion_matrix(checkpoint_path: Path, splits_dir: Path, out_path: Path):
+def plot_confusion_matrix(checkpoint_path: Path, splits_dir: Path, out_path: Path,
+                          backbone: str = "cnn"):
     """Generate confusion matrix from trained model on test set."""
     import torch
     import matplotlib.pyplot as plt
 
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-    from prepare import PoseDataset, DEVICE
-    from train import PoseEventClassifier
+    from prepare import DEVICE
+    from train import PoseEventClassifier, STGCNClassifier, MultiPersonPoseDataset
 
     test_dir = splits_dir / "test"
     if not test_dir.exists():
@@ -241,13 +242,16 @@ def plot_confusion_matrix(checkpoint_path: Path, splits_dir: Path, out_path: Pat
         return
 
     # Load model
-    model = PoseEventClassifier().to(DEVICE)
+    if backbone == "gcn":
+        model = STGCNClassifier().to(DEVICE)
+    else:
+        model = PoseEventClassifier(n_bodies=2).to(DEVICE)
     ckpt = torch.load(str(checkpoint_path), map_location=DEVICE, weights_only=True)
     model.load_state_dict(ckpt["model_state_dict"])
     model.eval()
 
     # Load test data
-    test_ds = PoseDataset(test_dir, augment=False)
+    test_ds = MultiPersonPoseDataset(test_dir, augment=False)
     loader = torch.utils.data.DataLoader(test_ds, batch_size=64, shuffle=False)
 
     all_preds = []
@@ -310,6 +314,8 @@ def main():
                         help="Model checkpoint for post-training confusion matrix")
     parser.add_argument("--quick", action="store_true",
                         help="Static PNG strips instead of animated GIFs (faster)")
+    parser.add_argument("--backbone", choices=["cnn", "gcn"], default="cnn",
+                        help="Backbone of the checkpoint being audited")
     parser.add_argument("--samples-per-class", type=int, default=3)
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
@@ -348,7 +354,8 @@ def main():
     if args.checkpoint:
         print("▶ Generating confusion matrix from trained model...")
         plot_confusion_matrix(args.checkpoint, args.splits_dir,
-                              args.output_dir / "confusion_matrix.png")
+                              args.output_dir / "confusion_matrix.png",
+                              backbone=args.backbone)
         print()
 
     print("╔══════════════════════════════════════════════════════════╗")

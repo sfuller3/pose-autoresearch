@@ -480,10 +480,19 @@ class StreamingDetector:
     """Loads the PoseEventClassifier model and runs per-frame inference."""
 
     def __init__(self, checkpoint_path: str, device: torch.device,
-                 n_bodies: int = 1):
+                 n_bodies: int = 1, backbone: str = "cnn"):
         self.device = device
         self.n_bodies = n_bodies
-        self.model = PoseEventClassifier(n_bodies=n_bodies).to(device)
+        self.backbone = backbone
+        if backbone == "gcn":
+            if n_bodies != 2:
+                raise ValueError(
+                    "GCN backbone requires tracking mode (n_bodies=2); "
+                    "remove --no-tracking or use --backbone cnn")
+            from train import STGCNClassifier
+            self.model = STGCNClassifier().to(device)
+        else:
+            self.model = PoseEventClassifier(n_bodies=n_bodies).to(device)
 
         ckpt = torch.load(checkpoint_path, map_location=device, weights_only=True)
         self.model.load_state_dict(ckpt["model_state_dict"])
@@ -983,7 +992,8 @@ def run_pipeline(args):
         )
 
     print("Loading event detection model...")
-    detector = StreamingDetector(args.checkpoint, device, n_bodies=n_bodies)
+    detector = StreamingDetector(args.checkpoint, device, n_bodies=n_bodies,
+                                 backbone=args.backbone)
 
     clip_recorder = ClipRecorder(
         pre_roll=int(args.pre_roll * source.fps),
@@ -1281,8 +1291,13 @@ def main():
                         help="Run environment detection every N frames")
     parser.add_argument("--no-tracking", action="store_true",
                         help="Disable multi-person tracking (single-person mode)")
+    parser.add_argument("--backbone", choices=["cnn", "gcn"], default="cnn",
+                        help="Classifier backbone (gcn loads checkpoints/best_model_gcn.pt by default)")
 
     args = parser.parse_args()
+    if args.backbone == "gcn" and args.checkpoint == parser.get_default("checkpoint"):
+        args.checkpoint = "checkpoints/best_model_gcn.pt"
+        print(f"[backbone=gcn] using default GCN checkpoint: {args.checkpoint}")
     run_pipeline(args)
 
 

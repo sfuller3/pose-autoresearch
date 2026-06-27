@@ -879,3 +879,236 @@ class TestDistanceDecay:
         """Neighbor at 2x frame diagonal → essentially zero."""
         decay = torch.sigmoid(torch.tensor(5.0 - 2.0 * 10))
         assert decay.item() < 0.001
+
+
+# ============================================================================
+# CTR-GCN BACKBONE TESTS
+# ============================================================================
+
+
+class TestTwoBodyGraph:
+    """Tests for the 34-joint two-person adjacency (CTR-GCN backbone)."""
+
+    def test_shape_and_dtype(self):
+        from pose_autoresearch.graph import get_two_body_adjacency
+        A = get_two_body_adjacency()
+        assert A.shape == (34, 34)
+        assert A.dtype == np.float32
+
+    def test_symmetric(self):
+        from pose_autoresearch.graph import get_two_body_adjacency
+        A = get_two_body_adjacency()
+        assert np.allclose(A, A.T, atol=1e-6)
+
+    def test_intra_body_edges_present(self):
+        from pose_autoresearch.graph import get_two_body_adjacency
+        A = get_two_body_adjacency()
+        # left_shoulder <-> right_shoulder for both bodies
+        assert A[5, 6] > 0
+        assert A[5 + 17, 6 + 17] > 0
+
+    def test_cross_body_edges_present(self):
+        from pose_autoresearch.graph import get_two_body_adjacency, TWO_BODY_CROSS_EDGES
+        A = get_two_body_adjacency()
+        for i, j in TWO_BODY_CROSS_EDGES:
+            assert A[i, j] > 0, f"cross edge ({i},{j}) missing"
+
+    def test_no_spurious_cross_edges(self):
+        from pose_autoresearch.graph import get_two_body_adjacency
+        A = get_two_body_adjacency()
+        # primary ankle (15) and neighbor ankle (32) are not connected
+        assert A[15, 32] == 0
+
+    def test_normalized(self):
+        from pose_autoresearch.graph import get_two_body_adjacency
+        A = get_two_body_adjacency()
+        # Symmetric normalization keeps values in (0, 1]
+        assert A.max() <= 1.0 + 1e-6
+        assert A.min() >= 0.0
+
+
+class TestGraphTemporalBlock:
+    """Multi-scale temporal conv over (B, C, T, V) graph features."""
+
+    def test_output_shape_stride1(self):
+        from train import GraphTemporalBlock
+        block = GraphTemporalBlock(64, stride=1)
+        block.eval()
+        x = torch.randn(2, 64, 150, 34)
+        with torch.no_grad():
+            out = block(x)
+        assert out.shape == (2, 64, 150, 34)
+
+    def test_output_shape_stride2(self):
+        from train import GraphTemporalBlock
+        block = GraphTemporalBlock(64, stride=2)
+        block.eval()
+        x = torch.randn(2, 64, 150, 34)
+        with torch.no_grad():
+            out = block(x)
+        assert out.shape == (2, 64, 75, 34)
+
+    def test_stride2_chains(self):
+        """150 -> 75 -> 38 like the spec's stage layout."""
+        from train import GraphTemporalBlock
+        b1 = GraphTemporalBlock(32, stride=2)
+        b2 = GraphTemporalBlock(32, stride=2)
+        b1.eval(); b2.eval()
+        x = torch.randn(1, 32, 150, 34)
+        with torch.no_grad():
+            out = b2(b1(x))
+        assert out.shape == (1, 32, 38, 34)
+
+    def test_gradient_flow(self):
+        from train import GraphTemporalBlock
+        block = GraphTemporalBlock(32)
+        x = torch.randn(2, 32, 50, 34, requires_grad=True)
+        block(x).sum().backward()
+        assert x.grad is not None
+        assert x.grad.abs().sum() > 0
+
+
+class TestCTRGraphBlock:
+    """Channel-wise topology refinement spatial unit."""
+
+    def _make_block(self, in_ch=6, out_ch=64):
+        from train import CTRGraphBlock
+        from pose_autoresearch.graph import get_two_body_adjacency
+        return CTRGraphBlock(in_ch, out_ch, get_two_body_adjacency())
+
+    def test_output_shape(self):
+        block = self._make_block()
+        block.eval()
+        x = torch.randn(2, 6, 150, 34)
+        with torch.no_grad():
+            out = block(x)
+        assert out.shape == (2, 64, 150, 34)
+
+    def test_alpha_initialized_to_zero(self):
+        """Identity-start: dynamic refinement begins disabled."""
+        block = self._make_block()
+        assert torch.all(block.alpha == 0)
+
+    def test_identity_start_ignores_affinity_weights(self):
+        """With alpha=0, perturbing theta/phi must not change the output."""
+        block = self._make_block()
+        block.eval()
+        x = torch.randn(2, 6, 50, 34)
+        with torch.no_grad():
+            out_a = block(x)
+            block.theta.weight.add_(1.0)
+            block.phi.weight.add_(-1.0)
+            out_b = block(x)
+        assert torch.allclose(out_a, out_b, atol=1e-5)
+
+    def test_alpha_changes_output_when_nonzero(self):
+        block = self._make_block()
+        block.eval()
+        x = torch.randn(2, 6, 50, 34)
+        with torch.no_grad():
+            out_a = block(x)
+            block.alpha.add_(0.5)
+            out_b = block(x)
+        assert not torch.allclose(out_a, out_b, atol=1e-4)
+
+    def test_gradient_reaches_alpha(self):
+        block = self._make_block()
+        x = torch.randn(2, 6, 50, 34)
+        block(x).sum().backward()
+        assert block.alpha.grad is not None
+
+    def test_zero_grad_for_theta_phi_at_identity_start(self):
+        """Documents ReZero-style behavior: theta/phi frozen until alpha moves."""
+        block = self._make_block()
+        x = torch.randn(2, 6, 50, 34)
+        block(x).sum().backward()
+        assert block.theta.weight.grad.abs().sum() == 0
+        assert block.phi.weight.grad.abs().sum() == 0
+
+
+class TestSTGCNClassifier:
+    """End-to-end CTR-GCN backbone."""
+
+    def test_forward_shape(self):
+        from train import STGCNClassifier
+        model = STGCNClassifier()
+        model.eval()
+        x = torch.randn(2, 150, 105)
+        with torch.no_grad():
+            out = model(x)
+        assert out.shape == (2, 7)
+
+    def test_zero_neighbor_no_nan(self):
+        """Single-person input (zero neighbor + zero metadata) is valid."""
+        from train import STGCNClassifier
+        model = STGCNClassifier()
+        model.eval()
+        x = torch.randn(2, 150, 105)
+        x[:, :, 51:] = 0
+        with torch.no_grad():
+            out = model(x)
+        assert out.shape == (2, 7)
+        assert not torch.isnan(out).any()
+
+    def test_distance_affects_output(self):
+        """Far neighbor (decayed) must differ from near neighbor."""
+        from train import STGCNClassifier
+        model = STGCNClassifier()
+        model.eval()
+        x_near = torch.randn(1, 150, 105)
+        x_far = x_near.clone()
+        x_near[:, :, 102] = 0.1
+        x_far[:, :, 102] = 2.0
+        with torch.no_grad():
+            out_near = model(x_near)
+            out_far = model(x_far)
+        assert not torch.allclose(out_near, out_far, atol=1e-3)
+
+    def test_film_conditioning(self):
+        from train import STGCNClassifier
+        model = STGCNClassifier(env_dim=32)
+        model.eval()
+        x = torch.randn(2, 150, 105)
+        env_a = torch.zeros(2, 32)
+        env_b = torch.ones(2, 32)
+        with torch.no_grad():
+            out_plain = model(x)                      # no env features
+            out_a = model(x, env_features=env_a)
+            out_b = model(x, env_features=env_b)
+        assert out_plain.shape == (2, 7)
+        assert not torch.allclose(out_a, out_b, atol=1e-4)
+
+    def test_param_budget(self):
+        from train import STGCNClassifier
+        model = STGCNClassifier()
+        n = sum(p.numel() for p in model.parameters())
+        assert n < 2_500_000, f"{n:,} params exceeds 2.5M budget"
+
+    def test_backward(self):
+        from train import STGCNClassifier
+        model = STGCNClassifier()
+        x = torch.randn(2, 150, 105, requires_grad=True)
+        model(x).sum().backward()
+        assert x.grad is not None
+        # gradient reaches both bodies and metadata
+        assert x.grad[:, :, :51].abs().sum() > 0
+        assert x.grad[:, :, 51:102].abs().sum() > 0
+
+
+class TestBackboneSelection:
+    def test_build_model_cnn_default(self):
+        from train import build_model, PoseEventClassifier
+        model, ckpt_path = build_model("cnn", env_dim=0, n_bodies=2)
+        assert isinstance(model, PoseEventClassifier)
+        assert ckpt_path == "checkpoints/best_model.pt"
+
+    def test_build_model_gcn(self):
+        from train import build_model, STGCNClassifier
+        model, ckpt_path = build_model("gcn", env_dim=0, n_bodies=2)
+        assert isinstance(model, STGCNClassifier)
+        assert ckpt_path == "checkpoints/best_model_gcn.pt"
+
+    def test_build_model_unknown_raises(self):
+        from train import build_model
+        with pytest.raises(ValueError):
+            build_model("transformer", env_dim=0, n_bodies=2)
