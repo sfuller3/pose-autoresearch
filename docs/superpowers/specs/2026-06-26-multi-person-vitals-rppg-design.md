@@ -21,6 +21,10 @@ Decisions locked during brainstorming:
   the existing coarse presence signal (a `PersonTracker` track = "body detected")
   with activity gradation and anti-spoof, and can optionally harden the event
   detector against static photos/posters — it is not a parallel mechanism.
+- **Deployment topology:** all processing is edge-local; the edge is push-only to
+  the cloud and never serves UIs directly. Cloud-down resilience is store-and-
+  forward for the data record, with a proposed local life-safety alert fallback
+  for critical events (see "Edge ↔ cloud topology & offline operation").
 
 This is additive. With `--vitals` off (the default), the pipeline behaves
 exactly as today — event detection is untouched.
@@ -267,6 +271,67 @@ at least a movement-based liveness state; only `LIVE_CONFIRMED` needs rPPG.
 - **CSV recorder** (validation aid): optional `--vitals-csv path` dumps
   `(timestamp, track_id, hr, rr, quality)` for offline comparison against a
   pulse-oximeter reference.
+
+## Data flow & resolution
+
+Diagram: `docs/superpowers/specs/2026-06-26-vitals-data-flow.svg`.
+
+The camera frame is decoded **once at full resolution** and forks:
+
+- **Full-res → local rotating buffer** (the existing `ClipRecorder`, kept at
+  full-res, review-only) and **→ per-ROI vitals sampling**. rPPG is the only
+  consumer that needs full-res pixels (skin-pixel SNR).
+- **Full-res → single downscale to 320/640 → pose + tracking.** Pose then fans
+  out to fall/event detection, liveness/activity, the privacy-shape display, and
+  face-ROI derivation. All of these run on the cheap reduced stream.
+
+**Coordinate scaling (load-bearing).** Keypoints come back in reduced-frame
+coordinates; the ROI extractor multiplies them by `full_res / pose_res` before
+indexing the full-res frame. The distance/resolution validity gate
+(`MIN_INTEROCULAR_PX`, `MIN_ROI_PX`) is evaluated in **full-res pixels**, so the
+threshold is meaningful regardless of the pose downscale factor.
+
+**Compute scales with vitals, not headcount.** Pose, fall, liveness, and privacy
+cost is fixed per frame; only the `max_people` capped faces incur full-res ROI
+sampling + rPPG.
+
+**Privacy boundary.** The live display renders only pose-derived shapes. Full-res
+video exists solely for (a) the local review buffer and (b) per-ROI vitals
+sampling — it is never sent to the display, and a static photo/poster can never
+reach `LIVE_CONFIRMED`.
+
+## Edge ↔ cloud topology & offline operation
+
+**Trust boundary — the edge never serves data to workers or families directly.**
+The edge device is **push-only to the cloud**; the cloud is the sole system that
+serves dashboards and apps to caregivers and families. No inbound viewing
+connections to the edge — this is both the product rule and the security/privacy
+posture. All CV/vitals processing is edge-local; raw full-res never leaves the
+edge unless a clip is explicitly escalated to the cloud for review.
+
+**Normal flow:** edge → cloud carries events (falls, abnormal vitals,
+unresponsiveness), vitals records, liveness/occupancy transitions, and clip
+references (clips uploaded only on escalation). Cloud → consumers (web/app).
+
+**Offline operation (cloud unreachable)** — split by stakes:
+
+- **Convenience monitoring** (live view, history, family access) is **cloud-only**
+  and simply unavailable until reconnect. Acceptable.
+- **The data record is never lost — store-and-forward (always on):** every event,
+  vitals record, liveness transition, and escalated clip persists to a durable
+  local queue and backfills on reconnect. The local store is bounded (ring) with
+  safety events retained at the highest priority.
+- **Edge self-health heartbeat:** the edge periodically reports its own liveness
+  to the cloud so a unit going offline is detectable and surfaced to staff.
+- **Local life-safety fallback (PROPOSED — pending confirmation):** for *critical*
+  events only (fall, prolonged unresponsiveness, severe abnormal vitals), the edge
+  raises a one-way alarm over the **local network** to the facility's own on-prem
+  infrastructure (nurse-call relay / LAN alert appliance / optional cellular SMS),
+  independent of the cloud. This is an alarm *to facility systems*, not a
+  data-serving UI, so it preserves "the edge never serves workers/families
+  directly" while ensuring life-safety alerts survive a cloud outage. Existing
+  `AlertDispatcher` (console + webhook) is the natural seam — a LAN/webhook target
+  on the local network is the minimal implementation.
 
 ## Testing
 
