@@ -25,6 +25,22 @@ Decisions locked during brainstorming:
 This is additive. With `--vitals` off (the default), the pipeline behaves
 exactly as today — event detection is untouched.
 
+## Deployment context
+
+- **Room:** small, ~12 × 12 ft. Subjects sit at ~6–12 ft from the camera — the
+  moderate-to-hard end of the rPPG distance range. At 1080p with a normal ~60°
+  lens, a face at the far wall is near the resolution floor (~28 px inter-ocular),
+  so **1080p input and a slightly narrow FOV lens are recommended when vitals are
+  enabled.** Event detection is unaffected and still runs at any resolution.
+- **Lighting:** varies through the day. The signal-quality gate is the primary
+  defense — bad light yields low SNR and an "acquiring" state rather than a wrong
+  reading.
+- **Night / IR mode:** the camera switches to monochrome NIR (IR-LED
+  illumination, single intensity channel). This is a first-class operating mode,
+  not an edge case — see "Illumination regimes" below. Per the brainstorm
+  decision: **liveness/occupancy/activity work 24/7; HR/RR are best-effort at
+  night** (NIR single-channel rPPG, quality-gated).
+
 ## Why deviate from the paper
 
 The paper targets a single subject (largest face) via BlazeFace + FaceMesh. Two
@@ -57,16 +73,29 @@ changes are required and two are improvements:
     `[m_y - 0.9d, m_y - 0.25d]`, width `~1.3d`.
   - **Cheeks:** two rotated boxes below the eyes, lateral of the nose, each
     `~0.6d` square, centered near `(eye + nose)/2` offset outward.
-- Validity gate: all required keypoints' confidence `>= KP_CONF_MIN` (default
-  0.4); reject near-profile faces when `ear`/`eye` geometry implies yaw beyond a
-  threshold or `d` is too small (face too far). Returns `None` when invalid.
+- Validity gate (returns `None` when any fails):
+  - all required keypoints' confidence `>= KP_CONF_MIN` (default 0.4);
+  - near-profile rejection when `ear`/`eye` geometry implies excessive yaw;
+  - **resolution floor:** inter-ocular `d >= MIN_INTEROCULAR_PX` (default 28 px)
+    and forehead ROI `>= MIN_ROI_PX` (default 30×30 px). This is the
+    distance/resolution gate — below it the face has too few skin pixels for a
+    trustworthy signal (SNR scales ~√pixels), so the person stays occupancy/
+    activity-tracked but rPPG is not attempted. Pixel-based, not distance-based,
+    so it self-adjusts to resolution and lens.
 - Output: list of ROI pixel masks/boxes (clipped to frame bounds) + a validity
   flag. Behind a clean interface so a FaceMesh-based extractor can be swapped in
   later without touching callers.
 
 **`RPPGEstimator` (stateless compute)**
-- `green_mean(frame, rois) -> float`: mean of the green channel (BGR index 1)
-  over the union of valid ROI pixels.
+- `roi_mean(frame, rois, regime) -> float`: mean pixel value over the union of
+  valid ROI pixels, channel chosen by illumination regime:
+  - **`DAY` (RGB):** green channel (BGR index 1) — the strongest visible PPG
+    channel.
+  - **`NIGHT` (IR/monochrome):** the single intensity channel (any channel; they
+    are equal in a grayscale frame). NIR PPG amplitude is lower, so night reads
+    lean harder on the quality gate.
+  The downstream `estimate(...)` chain is identical for both — only the source
+  scalar differs.
 - `estimate(timestamps, values, band) -> (freq_hz, quality)`:
   1. Detrend (remove DC + linear drift from lighting).
   2. Resample to even spacing via 1-D interpolation onto a uniform time grid at
@@ -83,10 +112,36 @@ changes are required and two are improvements:
   frames (default 512, ~17 s @30fps). Buffers size to `max(HR_WINDOW, RR_WINDOW)`.
 - Convert: `bpm = freq_hz * 60`.
 
+### Illumination regimes (day RGB / night IR)
+
+The camera runs visible RGB by day and monochrome NIR at night. The green-channel
+method has no green channel at night, so the source channel switches by regime.
+
+**`detect_regime(frame) -> DAY | NIGHT`** (`vitals.py`): a frame is `NIGHT` when
+its mean chroma saturation is near zero (R≈G≈B everywhere) — the reliable
+signature of IR/monochrome output, independent of camera metadata we may not get.
+Evaluated on a throttled cadence (e.g. once per second) and smoothed with
+hysteresis so a brief lighting change doesn't flap the regime.
+
+Behavior by regime:
+- **DAY:** green-channel rPPG as specified; HR and RR attempted normally.
+- **NIGHT:** single NIR intensity channel. HR attempted (best-effort, lower SNR);
+  the quality gate suppresses weak reads, so the HUD shows a night HR only when
+  it clears threshold. RR via rPPG is the hardest case and will frequently sit in
+  "acquiring" — acceptable per the decision that night vitals are best-effort.
+
+What does **not** change at night: tracking, the activity metric, and liveness up
+to `PRESENT_MOVING` all run on grayscale keypoints exactly as in daylight, so the
+occupancy/liveness signal is unaffected. Only the `LIVE_CONFIRMED` pulse rung is
+harder to reach, which the latch (`pulse_hold_s`) and quality gate handle
+honestly. The regime is logged with each vitals record so day/night reads are
+distinguishable downstream.
+
 ### `PersonState` additions (in `stream_detect.py`)
 
-- `vitals_buffer`: `collections.deque[(timestamp, green_mean)]`,
-  `maxlen = max(HR_WINDOW, RR_WINDOW)`.
+- `vitals_buffer`: `collections.deque[(timestamp, roi_mean)]`,
+  `maxlen = max(HR_WINDOW, RR_WINDOW)` (the scalar is green by day, NIR intensity
+  at night).
 - `hr_ema`, `rr_ema`: smoothed estimates (EMA alpha default 0.3).
 - `hr_quality`, `rr_quality`: last quality scores.
 - `last_vitals_frame`: frame index of last estimation (for cadence throttle).
@@ -204,7 +259,7 @@ at least a movement-based liveness state; only `LIVE_CONFIRMED` needs rPPG.
   Reuses the existing overlay drawing.
 - **Log:** `events/vitals_log.jsonl`, one record per report:
   `{track_id, timestamp, hr_bpm, rr_bpm, hr_quality, rr_quality, liveness,
-  activity}`. Liveness state *changes* also emit a record so occupancy
+  activity, regime}`. Liveness state *changes* also emit a record so occupancy
   transitions are logged even when no vitals are reported.
 - **Alerts:** abnormal HR/RR reuse `AlertDispatcher` (console + webhook), tagged
   with track_id, mirroring the event-alert path. Opt-in unresponsiveness alert
@@ -223,6 +278,13 @@ Unit (`tests/test_pipeline.py` additions):
 - **Quality gate:** pure Gaussian noise → low quality → `should_report` False.
 - **ROI geometry:** synthetic upright keypoints → forehead above eyes, cheeks
   flanking nose; rolled keypoints → boxes rotate; low-confidence/profile → `None`.
+- **Distance/resolution gate:** keypoints with inter-ocular below
+  `MIN_INTEROCULAR_PX` → `None` (rPPG skipped) while the track still reports
+  occupancy/activity; above the floor → valid ROIs.
+- **Regime detection:** a saturated RGB frame → `DAY` (samples green); a
+  grayscale/IR frame (R==G==B) → `NIGHT` (samples intensity); hysteresis holds
+  through a one-frame blip. NIR recovery: a known-frequency sinusoid in the
+  intensity channel still yields the right HR.
 - **Controller:** `max_people` cap selects largest faces; `cadence` throttles
   estimation; abnormal ranges flag correctly.
 - **Activity metric:** moving synthetic keypoints → high activity, static → ~0;
@@ -250,7 +312,7 @@ neighborhood: HR MAE < 5 bpm at rest, good face visibility.
 
 | File | Change |
 |------|--------|
-| `vitals.py` | New: `FaceROIExtractor`, `RPPGEstimator`, `ActivityEstimator`, `LivenessMonitor`, `LivenessState`, `VitalsController` |
+| `vitals.py` | New: `FaceROIExtractor`, `RPPGEstimator`, `ActivityEstimator`, `LivenessMonitor`, `LivenessState`, `VitalsController`, `detect_regime` / regime enum |
 | `stream_detect.py` | `PersonState` fields; per-person rPPG + liveness in `run_pipeline`; HUD; vitals log; CLI flags; optional `--live-gating` at the existing `apply_context_rules` call site |
 | `tests/test_pipeline.py` | New `TestFaceROIExtractor`, `TestRPPGEstimator`, `TestActivityEstimator`, `TestLivenessMonitor`, `TestVitalsController` |
 | `prepare.py` | No changes (immutable) |
@@ -259,8 +321,16 @@ neighborhood: HR MAE < 5 bpm at rest, good face visibility.
 
 - **Skin-tone & lighting** affect green-channel SNR; the quality gate suppresses
   bad reads rather than emitting wrong ones. CHROM/POS (paper Table 1) are more
-  robust than GREEN and can replace `RPPGEstimator.estimate` internals later
-  without interface change.
+  robust than GREEN and can replace the `DAY` channel extraction later without
+  interface change.
+- **Night/IR is physics-limited:** NIR PPG amplitude is inherently lower, so
+  night HR will report less often and RR rarely. This is expected and handled by
+  the quality gate + best-effort decision, not a defect. If night HR proves too
+  sparse in validation, a NIR-tuned method (e.g. larger ROI, longer window, or an
+  NIR-specific algorithm) is the upgrade path — behind the same interface.
+- **Regime mis-detection** (e.g. a very desaturated daytime scene) could pick the
+  wrong channel; hysteresis + the saturation threshold mitigate, and at worst the
+  quality gate rejects the resulting weak signal.
 - **Motion** is the dominant rPPG error source; the head-motion gate is a first
   defense, not a correction. Out of scope: motion compensation.
 - **5-keypoint ROI** may yield lower SNR than FaceMesh; the extractor interface
