@@ -44,14 +44,15 @@ INPUT_CHANNELS = 3   # Per-joint: x, y, confidence
 NUM_JOINTS = NUM_KEYPOINTS  # 17
 NUM_CLASSES = len(EVENT_CLASSES)  # 7
 SEQ_LEN = 150        # 5 seconds at 30fps
-BATCH_SIZE = 64
-LEARNING_RATE = 2e-3
+BATCH_SIZE = 256
+LEARNING_RATE = 3e-3
 WEIGHT_DECAY = 1e-4
 DROPOUT = 0.3
 
 # MixUp augmentation
 MIXUP_ALPHA = 0.2    # Beta(alpha, alpha) shape parameter; <1 is U-shaped
 MIXUP_PROB = 0.5     # Probability of applying MixUp to a given batch
+EMA_DECAY = 0.999    # Exponential moving average decay for model weights
 
 # ============================================================================
 # MULTI-PERSON DATASET
@@ -464,6 +465,32 @@ class PoseEventClassifier(nn.Module):
 # ============================================================================
 
 
+class ModelEMA:
+    """Exponential moving average of model parameters for smoother evaluation."""
+
+    def __init__(self, model, decay=EMA_DECAY):
+        self.decay = decay
+        self.shadow = {k: v.clone().detach() for k, v in model.state_dict().items()}
+
+    @torch.no_grad()
+    def update(self, model):
+        for k, v in model.state_dict().items():
+            if v.is_floating_point():
+                self.shadow[k].mul_(self.decay).add_(v, alpha=1 - self.decay)
+            else:
+                self.shadow[k].copy_(v)
+
+    def apply(self, model):
+        """Temporarily apply EMA weights to model. Returns original state_dict."""
+        original = {k: v.clone() for k, v in model.state_dict().items()}
+        model.load_state_dict(self.shadow)
+        return original
+
+    def restore(self, model, original):
+        """Restore original weights after EMA evaluation."""
+        model.load_state_dict(original)
+
+
 class FocalLoss(nn.Module):
     """Focal loss with per-class weights for hard-example mining.
 
@@ -521,40 +548,50 @@ def mixup_data(x, y, alpha=MIXUP_ALPHA):
 
 
 def train_epoch(model, dataloader, optimizer, criterion, scheduler, device,
-                use_mixup=True):
-    """Train for one epoch with optional temporal mixup."""
+                use_mixup=True, scaler=None, ema=None):
+    """Train for one epoch with optional temporal mixup and AMP."""
     model.train()
     total_loss = 0
     correct = 0
     total = 0
+    use_amp = scaler is not None
 
     for poses, labels in dataloader:
         poses = poses.to(device)
         labels = labels.to(device)
 
-        if use_mixup and torch.rand(()).item() < MIXUP_PROB:
-            poses, labels_a, labels_b, lam = mixup_data(poses, labels)
-            logits = model(poses)
-            loss = lam * criterion(logits, labels_a) + (1 - lam) * criterion(logits, labels_b)
-            preds = torch.argmax(logits, dim=1)
-            # Report accuracy vs original labels (labels_a) — cleaner than the soft proxy.
-            correct += (preds == labels_a).sum().item()
-        else:
-            logits = model(poses)
-            loss = criterion(logits, labels)
-            preds = torch.argmax(logits, dim=1)
-            correct += (preds == labels).sum().item()
+        with torch.amp.autocast("cuda", enabled=use_amp):
+            if use_mixup and torch.rand(()).item() < MIXUP_PROB:
+                poses, labels_a, labels_b, lam = mixup_data(poses, labels)
+                logits = model(poses)
+                loss = lam * criterion(logits, labels_a) + (1 - lam) * criterion(logits, labels_b)
+                preds = torch.argmax(logits, dim=1)
+                correct += (preds == labels_a).sum().item()
+            else:
+                logits = model(poses)
+                loss = criterion(logits, labels)
+                preds = torch.argmax(logits, dim=1)
+                correct += (preds == labels).sum().item()
 
         optimizer.zero_grad()
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        optimizer.step()
+        if use_amp:
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimizer.step()
 
         total_loss += loss.item()
         total += labels.size(0)
 
-    if scheduler is not None:
-        scheduler.step()
+        if scheduler is not None:
+            scheduler.step()
+        if ema is not None:
+            ema.update(model)
 
     return total_loss / len(dataloader), correct / total
 
@@ -587,21 +624,21 @@ def main():
         pin = DEVICE.type == "cuda"
         train_loader = DataLoader(
             train_ds, batch_size=BATCH_SIZE, shuffle=True,
-            num_workers=4, pin_memory=pin,
+            num_workers=4, pin_memory=True,
         )
         val_loader = DataLoader(
             val_ds, batch_size=BATCH_SIZE, shuffle=False,
-            num_workers=4, pin_memory=pin,
+            num_workers=4, pin_memory=True,
         )
         test_loader = DataLoader(
             test_ds, batch_size=BATCH_SIZE, shuffle=False,
-            num_workers=4, pin_memory=pin,
+            num_workers=4, pin_memory=True,
         )
     else:
         print("No data/splits/ found, using random split via get_dataloaders()")
         train_loader, val_loader, test_loader = get_dataloaders(
             batch_size=BATCH_SIZE,
-            num_workers=4,
+            num_workers=2,
             augment_train=True,
         )
 
@@ -632,8 +669,15 @@ def main():
         model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY,
     )
 
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=50, eta_min=1e-6,
+    num_batches = len(train_loader)
+    estimated_epochs = max(int(MAX_TIME_BUDGET_SECONDS / 10), 30)  # rough estimate
+    scheduler = torch.optim.lr_scheduler.OneCycleLR(
+        optimizer,
+        max_lr=LEARNING_RATE,
+        steps_per_epoch=num_batches,
+        epochs=estimated_epochs,
+        pct_start=0.1,
+        anneal_strategy="cos",
     )
 
     # Dynamic class weights from training set distribution
@@ -653,6 +697,9 @@ def main():
 
     criterion = FocalLoss(weight=class_weights, gamma=2.0, label_smoothing=0.1)
 
+    scaler = torch.amp.GradScaler("cuda") if DEVICE.type == "cuda" else None
+    ema = ModelEMA(model, decay=EMA_DECAY)
+
     start_time = time.time()
     epoch = 0
     best_val_acc = 0.0
@@ -670,18 +717,22 @@ def main():
         epoch_start = time.time()
 
         train_loss, train_acc = train_epoch(
-            model, train_loader, optimizer, criterion, scheduler, DEVICE
+            model, train_loader, optimizer, criterion, scheduler, DEVICE,
+            scaler=scaler, ema=ema,
         )
         epoch_time = time.time() - epoch_start
 
+        # Evaluate with EMA weights
+        orig = ema.apply(model)
         val_acc, val_loss = evaluate_model(model, val_loader, DEVICE)
+        ema.restore(model, orig)
 
         if val_acc > best_val_acc:
             best_val_acc = val_acc
             torch.save(
                 {
                     "epoch": epoch,
-                    "model_state_dict": model.state_dict(),
+                    "model_state_dict": ema.shadow,
                     "optimizer_state_dict": optimizer.state_dict(),
                     "val_acc": val_acc,
                 },
