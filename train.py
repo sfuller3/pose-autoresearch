@@ -58,8 +58,14 @@ INPUT_DIM = 51       # 17 keypoints x 3 (x, y, confidence)
 BONE_DIM = NUM_BONES * 3  # 16 bones x 3 (dx, dy, mean_conf)
 VELOCITY_DIM = 51    # 17 keypoints x 3 (vx, vy, confidence)
 FULL_INPUT_DIM = INPUT_DIM + BONE_DIM + VELOCITY_DIM  # 51 + 48 + 51 = 150
-MULTI_INPUT_DIM = 105    # 51 + 51 + 3 (primary + neighbor + metadata)
-MULTI_FULL_INPUT_DIM = 303  # 150 + 150 + 3
+# Inter-body interaction metadata appended per frame (see
+# MultiPersonPoseDataset._compute_metadata). Widened from 3 -> 7 to add
+# approach dynamics and limb-level proximity, which hip-to-hip distance alone
+# can't express — targets the working_together/aggression/wandering confusion
+# triangle (see STATUS.md confusion diagnostic, 2026-07-24).
+META_DIM = 7
+MULTI_INPUT_DIM = 102 + META_DIM       # primary(51) + neighbor(51) + metadata
+MULTI_FULL_INPUT_DIM = 300 + META_DIM  # primary_feats(150) + neighbor_feats(150) + metadata
 INPUT_CHANNELS = 3   # Per-joint: x, y, confidence
 NUM_JOINTS = NUM_KEYPOINTS  # 17
 NUM_CLASSES = len(EVENT_CLASSES)  # 7
@@ -99,6 +105,8 @@ class MultiPersonPoseDataset(torch.utils.data.Dataset):
     # Hip joint indices in COCO-17 format
     LEFT_HIP = 11
     RIGHT_HIP = 12
+    LEFT_WRIST = 9
+    RIGHT_WRIST = 10
     # Approximate frame diagonal for distance normalization (640x480 default)
     FRAME_DIAG = (640 ** 2 + 480 ** 2) ** 0.5
 
@@ -107,7 +115,7 @@ class MultiPersonPoseDataset(torch.utils.data.Dataset):
         self.augment = augment
         self.samples: list[tuple[np.ndarray, np.ndarray, np.ndarray, int]] = []
         # Each entry is (primary_kps, neighbor_kps, metadata, label_idx)
-        # primary_kps/neighbor_kps: (T, 51)   metadata: (T, 3)
+        # primary_kps/neighbor_kps: (T, 51)   metadata: (T, META_DIM)
 
         data_dir = Path(data_dir)
         for json_path in sorted(data_dir.glob("*.json")):
@@ -158,27 +166,74 @@ class MultiPersonPoseDataset(torch.utils.data.Dataset):
                 ))
 
     def _compute_metadata(self, primary: np.ndarray, neighbor: np.ndarray) -> np.ndarray:
-        """Compute per-frame metadata (3 dims) from hip midpoints.
+        """Compute per-frame inter-body interaction metadata (META_DIM dims).
+
+        Dims 0-2 are the original hip-midpoint geometry (unchanged so prior
+        checkpoints stay interpretable). Dims 3-6 add approach dynamics and
+        limb-level proximity — the signals that separate the two-body classes
+        working_together / aggression / wandering, which hip distance alone
+        cannot (see STATUS.md confusion diagnostic).
 
         Args:
             primary: (T, 17, 3) keypoints for the primary person
             neighbor: (T, 17, 3) keypoints for the neighbor person
 
         Returns:
-            metadata: (T, 3) — [dist_norm, relative_x, relative_y]
+            metadata: (T, META_DIM) —
+                [0] dist_norm            hip-midpoint distance / frame diagonal
+                [1] relative_x           hip-midpoint dx / frame diagonal
+                [2] relative_y           hip-midpoint dy / frame diagonal
+                [3] closing_speed        -d(dist_norm)/dt  (+ = approaching)
+                [4] wrist_min_dist       nearest wrist-wrist distance / diagonal
+                [5] wrist_closing_speed  -d(wrist_min_dist)/dt (+ = hands closing)
+                [6] motion_align         cos angle of the two hip velocity vectors
         """
         T = primary.shape[0]
-        metadata = np.zeros((T, 3), dtype=np.float32)
+        metadata = np.zeros((T, META_DIM), dtype=np.float32)
+        diag = self.FRAME_DIAG + 1e-8
 
         p_hip = (primary[:, self.LEFT_HIP, :2] + primary[:, self.RIGHT_HIP, :2]) / 2  # (T, 2)
         n_hip = (neighbor[:, self.LEFT_HIP, :2] + neighbor[:, self.RIGHT_HIP, :2]) / 2  # (T, 2)
 
         diff = n_hip - p_hip  # (T, 2)
-        dist = np.linalg.norm(diff, axis=1)  # (T,)
+        dist_norm = np.linalg.norm(diff, axis=1) / diag  # (T,)
 
-        metadata[:, 0] = dist / self.FRAME_DIAG  # normalized euclidean distance
-        metadata[:, 1] = diff[:, 0] / (self.FRAME_DIAG + 1e-8)  # relative_x
-        metadata[:, 2] = diff[:, 1] / (self.FRAME_DIAG + 1e-8)  # relative_y
+        metadata[:, 0] = dist_norm
+        metadata[:, 1] = diff[:, 0] / diag  # relative_x
+        metadata[:, 2] = diff[:, 1] / diag  # relative_y
+
+        # [3] closing speed: how fast hip-to-hip distance shrinks (frame diff).
+        # Positive = the two bodies are approaching. Distinguishes a rapid
+        # aggressive approach from slow independent drift (wandering).
+        d_dist = np.zeros(T, dtype=np.float32)
+        d_dist[1:] = dist_norm[1:] - dist_norm[:-1]
+        metadata[:, 3] = -d_dist
+
+        # [4] nearest wrist-to-wrist distance: hand proximity is the essence of
+        # aggression (strikes/pushes) and separates it from working_together.
+        p_wrists = primary[:, (self.LEFT_WRIST, self.RIGHT_WRIST), :2]   # (T, 2, 2)
+        n_wrists = neighbor[:, (self.LEFT_WRIST, self.RIGHT_WRIST), :2]  # (T, 2, 2)
+        # Pairwise over the 2x2 wrist cross-pairs -> (T, 2, 2) distances, min over pairs.
+        pair = p_wrists[:, :, None, :] - n_wrists[:, None, :, :]  # (T, 2, 2, 2)
+        wrist_dists = np.linalg.norm(pair, axis=-1)               # (T, 2, 2)
+        wrist_min = wrist_dists.reshape(T, -1).min(axis=1) / diag  # (T,)
+        metadata[:, 4] = wrist_min
+
+        # [5] wrist closing speed: strike/reach dynamics (frame diff of [4]).
+        d_wrist = np.zeros(T, dtype=np.float32)
+        d_wrist[1:] = wrist_min[1:] - wrist_min[:-1]
+        metadata[:, 5] = -d_wrist
+
+        # [6] motion alignment: cos angle between the two bodies' hip-velocity
+        # vectors. ~+1 = moving together (working_together / walking as a pair),
+        # near 0 or negative = independent or converging motion.
+        p_vel = np.zeros_like(p_hip)
+        n_vel = np.zeros_like(n_hip)
+        p_vel[1:] = p_hip[1:] - p_hip[:-1]
+        n_vel[1:] = n_hip[1:] - n_hip[:-1]
+        dot = (p_vel * n_vel).sum(axis=1)
+        norm = np.linalg.norm(p_vel, axis=1) * np.linalg.norm(n_vel, axis=1)
+        metadata[:, 6] = np.where(norm > 1e-6, dot / (norm + 1e-8), 0.0)
 
         return metadata
 
@@ -217,9 +272,9 @@ class MultiPersonPoseDataset(torch.utils.data.Dataset):
             pad_len = self.seq_len - T
             primary = np.concatenate([primary, np.zeros((pad_len, 51), dtype=np.float32)])
             neighbor = np.concatenate([neighbor, np.zeros((pad_len, 51), dtype=np.float32)])
-            metadata = np.concatenate([metadata, np.zeros((pad_len, 3), dtype=np.float32)])
+            metadata = np.concatenate([metadata, np.zeros((pad_len, META_DIM), dtype=np.float32)])
 
-        # Concatenate: primary(51) + neighbor(51) + metadata(3) = 105
+        # Concatenate: primary(51) + neighbor(51) + metadata(META_DIM)
         combined = np.concatenate([primary, neighbor, metadata], axis=1)
 
         return torch.tensor(combined, dtype=torch.float32), torch.tensor(label, dtype=torch.long)
@@ -360,14 +415,14 @@ class PoseEventClassifier(nn.Module):
         num_classes: int = NUM_CLASSES,
         dropout: float = DROPOUT,
         env_dim: int = 0,  # 0 = no environment conditioning
-        n_bodies: int = 1,  # 1 = single-body (51-dim), 2 = dual-body (105-dim)
+        n_bodies: int = 1,  # 1 = single-body (51-dim), 2 = dual-body (102+META_DIM)
     ):
         super().__init__()
         self.env_dim = env_dim
         self.n_bodies = n_bodies
 
         if n_bodies == 2:
-            in_dim = MULTI_FULL_INPUT_DIM  # 150 + 150 + 3 = 303
+            in_dim = MULTI_FULL_INPUT_DIM  # 150 + 150 + META_DIM
         else:
             in_dim = FULL_INPUT_DIM  # joint(51) + bone(48) + velocity(51) = 150
 
@@ -433,7 +488,7 @@ class PoseEventClassifier(nn.Module):
     def forward(self, x, env_features=None):
         """
         Args:
-            x: (batch, seq_len, D) -- D=51 for single-body, D=105 for dual-body
+            x: (batch, seq_len, D) -- D=51 for single-body, D=102+META_DIM for dual-body
             env_features: optional (batch, env_dim) -- environment context
         Returns:
             logits: (batch, num_classes)
@@ -441,10 +496,10 @@ class PoseEventClassifier(nn.Module):
         B, T, D = x.shape
 
         if self.n_bodies == 2:
-            # Split input: primary(51) + neighbor(51) + metadata(3)
+            # Split input: primary(51) + neighbor(51) + metadata(META_DIM)
             primary_raw = x[:, :, :51]
             neighbor_raw = x[:, :, 51:102]
-            metadata = x[:, :, 102:105]  # (B, T, 3)
+            metadata = x[:, :, 102:102 + META_DIM]  # (B, T, META_DIM)
 
             primary_kps = primary_raw.view(B, T, NUM_JOINTS, 3)
             neighbor_kps = neighbor_raw.view(B, T, NUM_JOINTS, 3)
@@ -458,7 +513,7 @@ class PoseEventClassifier(nn.Module):
             decay = torch.sigmoid(5 - dist_norm * 10)  # (B, T, 1)
             neighbor_feats = neighbor_feats * decay
 
-            # Concatenate: primary(150) + neighbor(150) + metadata(3) = 303
+            # Concatenate: primary(150) + neighbor(150) + metadata(META_DIM)
             x = torch.cat([primary_feats, neighbor_feats, metadata], dim=2)
         else:
             # Single-body path: identical to original behavior
