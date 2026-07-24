@@ -27,8 +27,28 @@ from prepare import (
 )
 from pose_autoresearch.augment import augment_pose_sequence
 from collections import Counter
+from datetime import datetime, timezone
 import json
+import os
+import subprocess
 import numpy as np
+
+# ============================================================================
+# RUN IDENTITY (set via environment so parallel runs never collide)
+# ============================================================================
+
+# POSE_RUN_NAME names the run. It determines the checkpoint filename and is
+# recorded in the run log, so two concurrent experiments can't overwrite each
+# other's weights (which silently corrupted the 2026-07-24 baseline run).
+RUN_NAME = os.environ.get("POSE_RUN_NAME", "default")
+RUN_NOTES = os.environ.get("POSE_RUN_NOTES", "")
+
+_ckpt_default = (
+    "checkpoints/best_model.pt" if RUN_NAME == "default"
+    else f"checkpoints/best_model_{RUN_NAME}.pt"
+)
+CHECKPOINT_PATH = Path(os.environ.get("POSE_CHECKPOINT", _ckpt_default))
+RUN_LOG_PATH = Path(os.environ.get("POSE_RUN_LOG", "experiments/runs.jsonl"))
 
 # ============================================================================
 # HYPERPARAMETERS (agent can modify)
@@ -48,6 +68,14 @@ BATCH_SIZE = 256
 LEARNING_RATE = 3e-3
 WEIGHT_DECAY = 1e-4
 DROPOUT = 0.3
+
+# Channel progression for the temporal blocks. The last value is the feature
+# dim consumed by the pool and classifier head. The wide (192/384) setting beat
+# the previous (128/256) one by +0.4pt val on equal wall-clock (2026-07-24).
+# Override for sweeps with POSE_BLOCK_CHANNELS="128,128,256,256".
+BLOCK_CHANNELS = tuple(
+    int(c) for c in os.environ.get("POSE_BLOCK_CHANNELS", "192,192,384,384").split(",")
+)
 
 # MixUp augmentation
 MIXUP_ALPHA = 0.2    # Beta(alpha, alpha) shape parameter; <1 is U-shaped
@@ -343,9 +371,6 @@ class PoseEventClassifier(nn.Module):
         else:
             in_dim = FULL_INPUT_DIM  # joint(51) + bone(48) + velocity(51) = 150
 
-        # Channel progression for temporal blocks. The last value is the
-        # feature dim consumed by the pool and classifier head.
-        BLOCK_CHANNELS = (128, 128, 256, 256)
         final_channels = BLOCK_CHANNELS[-1]
 
         self.input_bn = nn.BatchNorm1d(in_dim)
@@ -601,12 +626,68 @@ def train_epoch(model, dataloader, optimizer, criterion, scheduler, device,
 # ============================================================================
 
 
+def _git_rev() -> str:
+    """Short HEAD hash, with a ``+dirty`` suffix if the tree has changes."""
+    try:
+        rev = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            capture_output=True, text=True, timeout=5,
+        ).stdout.strip()
+        dirty = subprocess.run(
+            ["git", "status", "--porcelain"],
+            capture_output=True, text=True, timeout=5,
+        ).stdout.strip()
+        return f"{rev}+dirty" if dirty else rev
+    except Exception:
+        return "unknown"
+
+
+def record_run(*, best_val_acc, test_acc, test_loss, per_class,
+               epochs, elapsed, num_params) -> None:
+    """Append this run's config and results to the run log.
+
+    One JSON object per line so runs are never lost to a concurrent write and
+    the log survives crashes.  ``scripts/leaderboard.py`` renders it.
+    """
+    record = {
+        "run_name": RUN_NAME,
+        "timestamp": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "git_rev": _git_rev(),
+        "notes": RUN_NOTES,
+        "checkpoint": str(CHECKPOINT_PATH),
+        "val_acc": round(best_val_acc, 4),
+        "test_acc": round(test_acc, 4),
+        "test_loss": round(test_loss, 4),
+        "per_class": {k: round(v, 4) for k, v in per_class.items()},
+        "epochs": epochs,
+        "elapsed_s": round(elapsed, 1),
+        "num_params": num_params,
+        "config": {
+            "block_channels": list(BLOCK_CHANNELS),
+            "batch_size": BATCH_SIZE,
+            "learning_rate": LEARNING_RATE,
+            "weight_decay": WEIGHT_DECAY,
+            "dropout": DROPOUT,
+            "seq_len": SEQ_LEN,
+            "mixup_alpha": MIXUP_ALPHA,
+            "mixup_prob": MIXUP_PROB,
+            "ema_decay": EMA_DECAY,
+            "time_budget_s": MAX_TIME_BUDGET_SECONDS,
+        },
+    }
+    RUN_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with open(RUN_LOG_PATH, "a") as f:
+        f.write(json.dumps(record) + "\n")
+    print(f"Run logged to {RUN_LOG_PATH} as '{RUN_NAME}'")
+
+
 def main():
     print("=" * 70)
     print("POSE AUTORESEARCH - Training Run")
     print("=" * 70)
+    print(f"Run: {RUN_NAME} -> {CHECKPOINT_PATH}")
     print(f"Device: {DEVICE}")
-    print(f"Model: Temporal CNN")
+    print(f"Model: Temporal CNN {BLOCK_CHANNELS}")
     print(f"Batch Size: {BATCH_SIZE}")
     print(f"Learning Rate: {LEARNING_RATE}")
     print(f"Time Budget: {MAX_TIME_BUDGET_SECONDS}s")
@@ -735,8 +816,10 @@ def main():
                     "model_state_dict": ema.shadow,
                     "optimizer_state_dict": optimizer.state_dict(),
                     "val_acc": val_acc,
+                    "run_name": RUN_NAME,
+                    "block_channels": list(BLOCK_CHANNELS),
                 },
-                "checkpoints/best_model.pt",
+                CHECKPOINT_PATH,
             )
 
         print(
@@ -752,7 +835,7 @@ def main():
     print("=" * 70)
 
     # Final evaluation
-    ckpt = torch.load("checkpoints/best_model.pt", weights_only=True)
+    ckpt = torch.load(CHECKPOINT_PATH, weights_only=True)
     model.load_state_dict(ckpt["model_state_dict"])
 
     test_acc, test_loss = evaluate_model(model, test_loader, DEVICE)
@@ -766,10 +849,20 @@ def main():
         print(f"  {cls:20s}: {acc:.4f}")
     print()
 
+    record_run(
+        best_val_acc=best_val_acc,
+        test_acc=test_acc,
+        test_loss=test_loss,
+        per_class=per_class,
+        epochs=epoch,
+        elapsed=time.time() - start_time,
+        num_params=num_params,
+    )
+
     return best_val_acc
 
 
 if __name__ == "__main__":
-    Path("checkpoints").mkdir(exist_ok=True)
+    CHECKPOINT_PATH.parent.mkdir(parents=True, exist_ok=True)
     val_accuracy = main()
     print(f"\nFINAL VALIDATION ACCURACY: {val_accuracy:.4f}")

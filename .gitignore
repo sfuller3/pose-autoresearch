@@ -54,3 +54,7 @@ uv.lock
 
 # Worktrees
 .worktrees/
+
+# Experiment artifacts (weights are large; runs.jsonl is the durable record)
+experiments/*.pt
+experiments/*_output.txt
