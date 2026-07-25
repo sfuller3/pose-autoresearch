@@ -20,6 +20,10 @@ data/test_le2i/
 !data/raw/.gitkeep
 !data/processed/.gitkeep
 
+# Large datasets — never commit these (~5.4GB combined)
+data/ntu120/*.pkl
+data/splits/
+
 # YOLO models
 yolo*.pt
 
