@@ -2,7 +2,7 @@
 
 **Read this first when resuming work.** Updated at the end of each working session.
 
-Last updated: 2026-07-24
+Last updated: 2026-07-25
 
 ## Where things stand
 
@@ -20,6 +20,12 @@ before its final test eval, so it was evaluated and recorded post-hoc via
 
 Previous best was `wide-30min` (val 0.9579 / test 0.9590), still on the
 leaderboard.
+
+`wide-90min` **survived a direct challenge on 2026-07-25**: the inter-body
+interaction features (`META_DIM` 7) were tested at matched 90-minute budget and
+lost on test and on fall recall. Details in the negative-result section below.
+Note `LEADERBOARD.md` ranks by val and therefore shows the losing run at #1 —
+see the warning there.
 
 Full history: `experiments/LEADERBOARD.md` (generated from
 `experiments/runs.jsonl`).
@@ -69,6 +75,77 @@ interaction features** (relative distance, closing velocity, relative
 orientation between the two bodies) rather than a longer temporal window. The
 303-dim input concatenates two bodies but may not encode their interaction.
 
+### Interaction features — first result (2026-07-24, commit `2e67042`)
+
+Acted on the implication above: `META_DIM` 3 → 7, adding four inter-body
+channels — centroid closing speed, wrist-pair minimum distance, wrist closing
+speed, and hip-velocity motion alignment.
+
+`interaction-feats-30min-v2`: val 0.9582 / test 0.9618, 117 epochs.
+(v1 was interrupted at epoch 57 and is not on the leaderboard.)
+
+**Compare it against `wide-30min`, not `wide-90min`** — matched 30-minute
+budget. Against the 90-minute champion it looks like a regression, but that is
+a budget artifact, not a feature verdict:
+
+| class | wide-30min | interaction-v2 | Δ |
+|---|---|---|---|
+| working_together | 0.9682 | 0.9811 | **+1.3** |
+| unstable_gait | 0.9453 | 0.9583 | **+1.3** |
+| aggression | 0.9439 | 0.9480 | +0.4 |
+| eating | 0.9555 | 0.9555 | 0.0 |
+| fall | 0.9793 | 0.9778 | −0.2 |
+| sitting_standing | 0.9711 | 0.9734 | +0.2 |
+| wandering | 0.9512 | 0.9442 | **−0.7** |
+
+Overall test +0.28pt at equal budget. The two classes the channels were
+designed for moved the right way — `working_together` most of all — and fall
+recall held at 97.8%. But `wandering` went the *wrong* way, so the error
+triangle is not closed. Verdict: promising, not proven.
+
+The confound is budget. The only comparison available is 30 min vs the
+champion's 90, so the feature change has never been tested at full training
+length.
+
+### Interaction features — settled at 90 min (2026-07-25). NEGATIVE RESULT.
+
+`interaction-feats-90min`: val 0.9634 / test **0.9645**, 452 epochs, clean run.
+The apples-to-apples test against `wide-90min` (val 0.9629 / test 0.9659).
+
+**It did not beat the champion, and the 30-minute result did not replicate.**
+
+| class | wide-90min | interaction-90min | Δ |
+|---|---|---|---|
+| unstable_gait | 0.9714 | 0.9766 | **+0.52** |
+| working_together | 0.9828 | 0.9854 | +0.26 |
+| eating | 0.9634 | 0.9634 | 0.00 |
+| sitting_standing | 0.9758 | 0.9746 | −0.12 |
+| wandering | 0.9434 | 0.9411 | −0.23 |
+| fall | 0.9852 | 0.9822 | **−0.30** |
+| aggression | 0.9546 | 0.9488 | **−0.58** |
+
+It won val by +0.0005 and lost test by −0.0014 — both inside noise. That split
+is the finding: no evidence the channels help at full budget.
+
+The damning part is `aggression`. At 30 min the channels appeared to help it
+(+0.4); at 90 min it is the **worst** class delta (−0.58) — sign-flipped.
+`working_together`'s +1.3 shrank to +0.26. Read together, the 30-minute signal
+was mostly noise. Two further points that close off the easy excuses:
+`fall` **dropped to 0.9822** from 0.9852, against the one class this project
+protects; and the run trained *longer* than the champion (452 vs 299 epochs),
+so "needs more epochs" is not available as an explanation.
+
+**Verdict: the four channels as currently defined do not work.** Not promoted.
+`checkpoints/best_model.pt` untouched, `META_DIM` stays 3 in the `train.py`
+defaults. The feature code remains on `2e67042` for anyone who wants to iterate
+on the channel definitions rather than discard the idea.
+
+> ⚠️ **`LEADERBOARD.md` will disagree with this section.** It sorts by *val*, so
+> it lists `interaction-feats-90min` at #1 and prints "Best so far:
+> interaction-feats-90min". That is a sorting artifact — the run lost on test
+> and on fall. **`wide-90min` is the best model.** Trust this file over the
+> leaderboard header until `scripts/leaderboard.py` is taught to rank by test.
+
 ## Next steps
 
 1. ~~**Longer wide run**~~ — **DONE**. `wide-90min` is the new best (test 0.9659,
@@ -76,17 +153,30 @@ orientation between the two bodies) rather than a longer temporal window. The
    epoch 331 (best at 299), so an even longer run may still have headroom, but
    with diminishing returns — the val curve had flattened to ~0.960–0.963 for
    the last ~30 epochs.
-2. **Inter-body interaction features** (NEW top priority — see the confusion
-   diagnostic above). Add explicit relative-geometry channels between the two
-   tracked bodies: pairwise distance (e.g. centroid + wrist-to-wrist), closing
-   velocity, and relative orientation. This targets the entire
-   `{working_together, aggression, wandering}` error triangle at once, which is
-   where essentially all remaining headroom is.
-3. **Longer temporal window** (`SEQ_LEN=300`) — now demoted. The matrix shows
-   `wandering`'s errors go to `aggression`, not a diffuse temporal smear, so a
-   longer window is a weaker bet than #2. Still worth trying if #2 stalls.
-4. **Aggression → working_together** confirmed as the dominant aggression error
-   (47 samples). Whatever helps #2 should help this directly.
+2. ~~**Inter-body interaction features**~~ — **DONE, NEGATIVE.** Built
+   (`2e67042`), tested at 30 min and 90 min. Lost to `wide-90min` on test and on
+   fall; the 30-min gains did not replicate. Not promoted. See the section above.
+3. ~~**Settle the interaction features at 90 min**~~ — **DONE 2026-07-25.**
+   Answered: no. `wide-90min` remains the best model.
+4. **Treat run-to-run noise as a first-class problem** (NEW top priority). This
+   session cost 90 minutes to discover that a +0.28pt "win" was noise. Every
+   comparison in this project is single-seed, and the gaps that decide promotion
+   (0.001–0.003) are the same size as the noise. Before the next feature
+   experiment, run `wide-90min`'s exact config 3× under different seeds and
+   measure the spread. That number is the minimum bar any future change must
+   clear, and without it the leaderboard's ranking is not meaningful.
+5. **Fix `wandering` specifically.** Still the weakest class (0.9411–0.9434) and
+   unmoved by anything tried so far. Its dominant error is
+   `wandering → aggression` (55 samples). The interaction channels made it
+   slightly worse in both runs, which weakly suggests closing-speed and
+   wrist-distance make an aimless walker near another body look like an
+   approach — but treat that as a hypothesis, not a finding, given #4.
+6. **Longer temporal window** (`SEQ_LEN=300`) — still unrun, and now the main
+   untested structural idea, since the interaction-feature route is closed. The
+   confusion matrix argued against it (`wandering`'s errors are concentrated on
+   `aggression`, not smeared), but that argument has not actually been tested.
+7. **Teach `scripts/leaderboard.py` to rank by test, not val** — small chore,
+   but it currently crowns a run that lost. See the warning above.
 
 ## How to run an experiment
 
